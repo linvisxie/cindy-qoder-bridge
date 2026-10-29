@@ -1,0 +1,26 @@
+{
+  "name": "cindy-qoder-bridge",
+  "version": "0.1.9",
+  "private": true,
+  "description": "Cindy 插件：读取本机 Qoder CN 登录态，起一个本地 OpenAI / Anthropic / Responses 三协议兼容端点，供 Cindy 的「自定义供应商」接入。",
+  "license": "MIT",
+  "author": "linvis",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "os": [
+    "win32"
+  ],
+  "scripts": {
+    "pack": "node scripts/pack.cjs",
+    "verify": "node scripts/verify-manifest.cjs"
+  },
+  "keywords": [
+    "cindy",
+    "cindy-plugin",
+    "qoder",
+    "openai-compatible",
+    "anthropic-messages",
+    "openai-responses"
+  ]
+}

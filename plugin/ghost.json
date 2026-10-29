@@ -1,0 +1,62 @@
+{
+  "schemaVersion": 3,
+  "id": "qoder-bridge",
+  "name": "Qoder 桥",
+  "version": "0.1.9",
+  "releaseNotes": "补齐和 DSH 一样的体验：面板能看每日签到并一键签到、额度重置时间与会员到期日、今日本地用量（请求数/tokens/折算）、模型列表带倍率和推理档位；错误码翻成人话（登录失效/每日上限/排队都有明确提示）；worker 日志落盘到 bridge.log（超 2MB 自动轮转）。",
+  "minCindyVersion": "0.1.119",
+  "author": "linvis",
+  "description": "读取本机 Qoder CN 客户端的登录状态，在本机起一个 OpenAI 兼容接口，供 Cindy 的「自定义供应商」指向。不修改 Cindy 任何文件，也不会替你填供应商配置。",
+  "whenToUse": "用户想在 Cindy 里用 Qoder 的模型（Qwen/DeepSeek/GLM/Kimi/MiniMax）时；用户问 Qoder 桥的地址、状态、剩余额度时；用户说 Qoder 登录过期、要重新登录时。",
+  "entry": "main.js",
+  "launch": "resident",
+  "command": "qoder",
+  "node": {
+    "entry": "node/worker.cjs",
+    "protocol": "json-rpc-stdio",
+    "lifecycle": "resident"
+  },
+  "tools": [
+    {
+      "name": "qoder_status",
+      "description": "查询 Qoder 桥的运行状态：登录账号、监听端口、可用模型数量、剩余额度。用户问「Qoder 能不能用」「还剩多少额度」时调用。",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "qoder_endpoint",
+      "description": "返回在 Cindy 里配置自定义供应商所需的全部信息：Base URL、API Key、模型 ID 列表（含上下文窗口与倍率）。用户问「怎么在 Cindy 里加 Qoder」「地址是什么」时调用。",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "qoder_refresh",
+      "description": "强制重新读取 Qoder 登录态并刷新模型目录。用户说「登录不上」「模型没更新」「刚在 Qoder 里重新登录了」时调用。",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "qoder_checkin",
+      "description": "领取 Qoder 每日签到奖励（每天 10:00 换新，每轮一次）。用户说「签到」「领今天的奖励」时调用。",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      }
+    }
+  ],
+  "panel": {
+    "title": "Qoder 桥",
+    "html": "panel.html",
+    "position": "right"
+  }
+}

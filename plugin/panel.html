@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Qoder 桥</title>
+<style>
+  :root {
+    --fg: var(--text-primary, #1a1a1a);
+    --fg2: var(--text-tertiary, #666);
+    --bg: var(--panel-bg, #fff);
+    --line: var(--border-default, #e4e4e0);
+    --ok: #16a34a; --warn: #d97706; --err: #dc2626;
+    --accent: #2563eb; --chip: var(--surface, #f4f4f5);
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 14px; background: var(--bg); color: var(--fg);
+    font: 13px/1.55 -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  }
+  h1 { font-size: 15px; margin: 0 0 12px; display: flex; align-items: center; gap: 8px; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--fg2); flex: none; }
+  .dot.ok { background: var(--ok); } .dot.warn { background: var(--warn); } .dot.err { background: var(--err); }
+  .card { border: 1px solid var(--line); border-radius: 10px; padding: 12px; margin-bottom: 12px; }
+  .card h2 { font-size: 12px; margin: 0 0 8px; color: var(--fg2); font-weight: 600; }
+  .row { display: flex; justify-content: space-between; gap: 10px; padding: 3px 0; }
+  .row .k { color: var(--fg2); flex: none; }
+  .row .v { text-align: right; word-break: break-all; font-variant-numeric: tabular-nums; }
+  .kv { font-family: ui-monospace, Consolas, monospace; font-size: 12px; background: var(--chip);
+        padding: 6px 8px; border-radius: 6px; word-break: break-all; margin-top: 4px; }
+  button { font: inherit; padding: 5px 12px; border-radius: 7px; cursor: pointer;
+    border: 1px solid var(--line); background: var(--chip); color: var(--fg); }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button:disabled { opacity: .55; cursor: default; }
+  .actions { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
+  .models { max-height: 260px; overflow: auto; border-top: 1px solid var(--line); margin-top: 6px; }
+  .m { display: flex; justify-content: space-between; gap: 8px; padding: 5px 0; border-bottom: 1px solid var(--line); }
+  .m:last-child { border-bottom: 0; }
+  .m .id { font-family: ui-monospace, Consolas, monospace; font-size: 12px; }
+  .m .meta { color: var(--fg2); font-size: 11px; flex: none; }
+  .hint { color: var(--fg2); font-size: 12px; margin-top: 8px; }
+  .err { color: var(--err); font-size: 12px; margin-top: 8px; }
+  .steps { margin: 0; padding-left: 18px; color: var(--fg2); font-size: 12px; }
+  .steps li { margin: 3px 0; }
+  .chip { display: inline-block; padding: 1px 7px; border-radius: 999px; font-size: 11px;
+          background: var(--chip); border: 1px solid var(--line); color: var(--fg2); }
+  .chip.ok { color: var(--ok); border-color: var(--ok); }
+  .chip.warn { color: var(--warn); border-color: var(--warn); }
+  .m .lab { color: var(--fg2); font-size: 11px; }
+  .m .eff { color: var(--accent); font-size: 11px; }
+</style>
+</head>
+<body>
+
+<h1><span class="dot" id="dot"></span><span id="title">Qoder 桥</span></h1>
+
+<div class="card">
+  <h2>运行状态</h2>
+  <div class="row"><span class="k">账号</span><span class="v" id="user">—</span></div>
+  <div class="row"><span class="k">模型</span><span class="v" id="modelCount">—</span></div>
+  <div class="row"><span class="k">额度</span><span class="v" id="quota">—</span></div>
+  <div class="row"><span class="k">额度重置</span><span class="v" id="resetAt">—</span></div>
+  <div class="row"><span class="k">会员到期</span><span class="v" id="expiresAt">—</span></div>
+  <div class="row"><span class="k">本地端口</span><span class="v" id="port">—</span></div>
+  <div class="err" id="err" hidden></div>
+  <div class="actions">
+    <button class="primary" id="refresh">刷新登录态与模型</button>
+    <button id="copy">复制配置</button>
+  </div>
+</div>
+
+<div class="card">
+  <h2>每日签到</h2>
+  <div class="row"><span class="k">今天</span><span class="v"><span class="chip" id="ckState">—</span></span></div>
+  <div class="row"><span class="k">下次开轮</span><span class="v" id="ckNext">—</span></div>
+  <div class="row"><span class="k">本地用量</span><span class="v" id="localUsage">—</span></div>
+  <div class="actions">
+    <button class="primary" id="checkin">立即签到</button>
+  </div>
+  <div class="hint">Qoder 每天 10:00 换新的一轮，每轮只能领一次。</div>
+</div>
+
+<div class="card">
+  <h2>在 Cindy 里接入（只需一次）</h2>
+  <ol class="steps">
+    <li>设置 → 模型 → 添加自定义供应商</li>
+    <li>协议选 <b>OpenAI Compatible / Chat Completions</b></li>
+    <li>Base URL 与 API Key 填下面两行</li>
+    <li>逐个添加模型 ID，上下文窗口填 1000000，勾选视觉输入</li>
+  </ol>
+  <div class="kv" id="baseUrl">—</div>
+  <div class="kv" id="token">—</div>
+</div>
+
+<div class="card">
+  <h2>可用模型 <span id="mcount" style="color:var(--fg2);font-weight:400"></span></h2>
+  <div class="models" id="models"><div class="hint">正在叫醒插件…</div></div>
+</div>
+
+<script src="/panel.js"></script>
+</body>
+</html>

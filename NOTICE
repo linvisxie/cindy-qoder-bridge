@@ -1,0 +1,13 @@
+Qoder 桥（Cindy 插件）
+
+Copyright (c) 2026 linvis
+
+本项目以 MIT 许可发布，全文见 LICENSE。
+
+本项目包含第三方代码：plugin/node/worker.cjs 的协议层移植自
+@eghrhegpe/dsh-connect-qoder 0.7.6（MIT，Copyright (c) 2026 eghrhegpe，
+https://github.com/eghrhegpe/dsh-connect-qoder）。
+该第三方的版权声明与许可全文见 THIRD-PARTY-NOTICES.md，分发时必须一并保留。
+
+本插件为非官方项目，与 Qoder / 阿里巴巴无隶属关系，未获其授权或认可。
+使用它可能违反 Qoder 的用户协议，风险由使用者自行承担。
