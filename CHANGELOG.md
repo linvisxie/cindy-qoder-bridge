@@ -4,6 +4,28 @@
 
 ---
 
+## 0.1.11
+
+修一个 codex 引擎必踩的坑：**助手先说一句话、紧接着发起函数调用，整条链路就断**。
+
+报错长这样：
+
+```
+{"error":{"message":"请求格式不对: Cannot read properties of undefined (reading 'push')","type":"invalid_request_error"}}
+```
+
+原因在 Responses 适配层。`responsesRequestToChat` 把 Responses 的 input 数组翻成 chat 的 messages 时，纯文本的 assistant 消息由 `pushMessage` 造，只有 `{role, content, __assistant:true}`；而 `function_call` 由 `pushCall` 处理，逻辑是「上一条是 assistant 就复用，否则新建一条带 `tool_calls: []` 的」。复用路径没有补数组，`last.tool_calls.push(...)` 就砸在 `undefined` 上。
+
+所以触发条件是「assistant 先输出文本 → 后面跟 function_call」，而这正是 codex 引擎最常见的形态（模型习惯先说「我先看一下」再调工具）。
+
+**这个 bug 0.1.9 就有，不是 0.1.10 引入的**——用 `git show 0c824db:plugin/node/adapters.cjs` 跑同一段复现，一样抛。只是 0.1.10 之前它落进通用 catch 报 500，看不出门道；0.1.10 统一成 `400 请求格式不对：…` 之后才浮出水面。
+
+修法是复用前补一句 `if (!Array.isArray(last.tool_calls)) last.tool_calls = [];`。
+
+实测：assistant 文本 + `function_call` + `function_call_output` 的组合现在 200；连续两个 `function_call` 合成一条 assistant 消息；带 `tools` 且模型真返回 `function_call` 时，输出项类型正确为 `function_call`（`arguments` 原样透传）。八套测试仍全绿。
+
+---
+
 ## 0.1.10
 
 处理一轮代码审计报出来的问题。修的都是「出错时表现错了」这一类，正常路径的行为没动：

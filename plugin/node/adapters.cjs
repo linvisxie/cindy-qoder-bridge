@@ -344,6 +344,11 @@ function responsesRequestToChat(body) {
       last = { role: 'assistant', content: '', tool_calls: [], __assistant: true };
       messages.push(last);
     }
+    // 复用一个由 pushMessage 造出来的 assistant 消息时，它身上可能没有 tool_calls
+    // （纯文本回复，直到下一项才是 function_call）。以前这里直接 .push 会 TypeError，
+    // 报出来是「Cannot read properties of undefined (reading 'push')」——
+    // 助手只要先说一句话再调工具，这条链路就整条断掉。
+    if (!Array.isArray(last.tool_calls)) last.tool_calls = [];
     last.tool_calls.push({
       id: typeof call.call_id === 'string' && call.call_id ? call.call_id
         : (typeof call.id === 'string' && call.id ? call.id : 'call_' + randomBytes(8).toString('hex')),

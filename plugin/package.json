@@ -1,6 +1,6 @@
 {
   "name": "cindy-qoder-bridge",
-  "version": "0.1.10",
+  "version": "0.1.11",
   "private": true,
   "description": "Cindy 插件：读取本机 Qoder CN 登录态，起一个本地 OpenAI / Anthropic / Responses 三协议兼容端点，供 Cindy 的「自定义供应商」接入。",
   "license": "MIT",
