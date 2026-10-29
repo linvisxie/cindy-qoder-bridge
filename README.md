@@ -1,24 +1,68 @@
-# Qoder 桥（Cindy 插件）
+<h1 align="center">cindy-qoder-bridge</h1>
 
-把 **Qoder CN** 的模型接到 **Cindy** 里用 —— 装好、在 Cindy 里填一次供应商，之后正常启动 Cindy 就有。
+<p align="center"><b>把本机已登录的 Qoder CN 模型接入 Cindy，零配置用你自己的账号额度。</b></p>
 
-> **非官方项目。** 本插件不隶属于 Qoder / 阿里巴巴，也没有得到其授权或认可。它通过读取你本机已安装的 Qoder CN 客户端的登录态，在本地起一个兼容端点来转发请求。
->
-> **使用前请读完 [风险与合规](#风险与合规) 一节。** 这属于逆向实现，可能违反 Qoder 的用户协议，后果（包括账号被风控、配额被清零）由使用者自行承担。
+<p align="center">
+  <a href="#安装">安装</a> ·
+  <a href="#工作原理">工作原理</a> ·
+  <a href="#面板能看什么">面板</a> ·
+  <a href="CHANGELOG.md">更新日志</a> ·
+  <a href="https://github.com/linvisxie/cindy-qoder-bridge/issues">问题反馈</a>
+</p>
 
----
+<p align="center">
+  <a href="https://github.com/linvisxie/cindy-qoder-bridge/releases"><img src="https://img.shields.io/github/v/release/linvisxie/cindy-qoder-bridge?style=flat-square&label=release&color=cb3837" alt="release"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/linvisxie/cindy-qoder-bridge?style=flat-square" alt="MIT license"></a>
+  <a href="https://github.com/linvisxie/cindy-qoder-bridge/stargazers"><img src="https://img.shields.io/github/stars/linvisxie/cindy-qoder-bridge?style=flat-square" alt="GitHub stars"></a>
+  <a href="https://github.com/linvisxie/cindy-qoder-bridge/issues"><img src="https://img.shields.io/github/issues/linvisxie/cindy-qoder-bridge?style=flat-square" alt="issues"></a>
+  <img src="https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-0078d4?style=flat-square" alt="platform">
+  <img src="https://img.shields.io/badge/node-%E2%89%A522-339933?style=flat-square" alt="node">
+  <img src="https://img.shields.io/badge/Cindy-%E2%89%A50.1.119-4c6ef5?style=flat-square" alt="cindy">
+</p>
 
-## 它做什么
+把本机已登录的 **Qoder CN** 模型接入 [Cindy](https://cindy.chat)，
+在 Cindy 的模型选择器里直接用你自己的 Qoder 账号额度 —— 不需要 API Key，不需要额外订阅。
+
+插件在 `127.0.0.1:47821` 起一个本地端点，同时讲三种协议（OpenAI Chat / Anthropic Messages / OpenAI Responses），
+Cindy 的三个 harness 引擎（`pi` / `claude-code` / `codex`）都能接。
+
+<p align="center">
+  <img src="assets/panel.png" width="420" alt="Qoder 桥面板：账号、模型数、额度、额度重置、会员到期、本地端口，以及每日签到卡片与今日本地用量">
+</p>
+
+右侧栏的「Qoder 桥」面板：账号与绿灯、模型数、套餐内额度、会员到期、本地端口，
+下面一张独立的「每日签到」卡片 —— 今天签没签、下次开轮是什么时候、今天本地打了多少请求与 token。
+「复制配置」一次拷走 Base URL + API Key。
+
+面板只读 Qoder 自己的接口和你本机的账本，**不会**替你自动签到，签到那一下永远要你自己点。
+
+模型名里带倍率（`· 免费` / `· x0.2` / `· x1`），Cindy 的供应商列表能直接看出来哪个便宜：
+
+<p align="center">
+  <img src="assets/models.png" width="620" alt="Cindy 供应商页的模型列表：DeepSeek-Flash · 免费、DeepSeek-V4-Pro · x0.5、GLM-5.3-Flash · x0.1 等">
+</p>
+
+## 工作原理
 
 ```
 Cindy 里的对话
-   ↓  OpenAI Chat / Anthropic Messages / OpenAI Responses 三种协议之一
-http://127.0.0.1:47821/v1        ← 本插件起的本地端点（只在 127.0.0.1 上听）
-   ↓  转成 Qoder 网关自己的协议（COSY 签名 + Encode 置换）
-Qoder CN 网关                    ← 用你自己 Qoder 账号的配额
+  -> OpenAI Chat / Anthropic Messages / OpenAI Responses 三种协议之一
+  -> http://127.0.0.1:47821/v1        本插件起的本地端点（只听 127.0.0.1）
+  -> COSY 签名 + Encode 置换           上游不是 OpenAI 兼容端点
+  -> https://gateway.qoder.com.cn/     用你自己 Qoder 账号的配额
+  -> 双层包装 SSE
+  -> 翻回对应协议
 ```
 
-三个组件：
+Qoder 不是 OpenAI 兼容端点，所以需要三样东西：
+
+1. **COSY 签名头** —— 每个网关请求都带 `Cosy-*` 头与 `Authorization: Bearer COSY.<payload>.<sig>`。
+2. **置换 base64 请求体** —— 查询串里的 `Encode=1` 表示 JSON 体要先 base64、再按换过的字母表替换、最后三分旋转。
+3. **双层 SSE** —— 每个 `data:` 帧是信封对象，它的 `body` 字段本身又是 JSON 字符串。
+
+登录态是每次现从 Qoder CN 客户端目录里的 `auth.v1.dat` 解的（OSCrypt v10 → DPAPI），**只在内存里用，不落盘**。
+
+四个组件：
 
 | 文件 | 角色 |
 |---|---|
@@ -27,9 +71,7 @@ Qoder CN 网关                    ← 用你自己 Qoder 账号的配额
 | `plugin/node/adapters.cjs` | Anthropic / Responses 与 OpenAI Chat 之间的协议翻译 |
 | `plugin/panel.*` | 右侧栏面板：账号、额度、签到、模型列表、Base URL / API Key |
 
-它**不改 Cindy 的任何文件**，也不替你填供应商配置（Cindy 没有给插件这个接口）。它就是给你一个端点，剩下那步在 Cindy 界面里点。
-
----
+它**不改 Cindy 的任何文件**，也不替你填供应商配置（Cindy 没给插件这个接口）。它就是给你一个端点，剩下那步在 Cindy 界面里点。
 
 ## 环境依赖（请逐条核对）
 
@@ -43,8 +85,6 @@ Qoder CN 网关                    ← 用你自己 Qoder 账号的配额
 | 磁盘 | ~100 KB | 插件本体；运行数据（日志、用量账本）另算，在 `%APPDATA%\CindyGlobal\qoder-bridge\`。 |
 
 > 不需要 API Key，不需要 OpenAI / Anthropic 账号，不需要额外订阅。用的是你自己 Qoder 账号里已有的配额。
-
----
 
 ## 安装
 
@@ -104,19 +144,16 @@ Cindy → 插件页 → 导入 `.cindy`（也可以直接把文件拖进去）�
 2. `47821` 被别的软件占了 → worker 会顺延到 `47822`…，此时面板显示的 Base URL 变了，要去 Cindy 里改一下。
 3. 卸载重装插件 → 供应商要重新填一次。
 
----
-
 ## 面板能看什么
 
-- **登录态**：账号名、绿灯/红点
+- **登录态**：账号名、绿灯 / 红点
 - **额度**：已用 / 总量、附加包额度、额度到期日、会员到期日
 - **每日签到**：今天签没签、可领多少 Credits、下一次 10:00 的倒计时，带「立即签到」按钮
 - **今日用量**：请求数 / tokens / 折算量（token × 倍率）
 - **模型列表**：每个模型的倍率（`· x0.2` / `· 免费`）与推理档位
+- **日志**：`bridge.log` 路径，出问题先看它
 
 AI 侧也能问：`qoder_status`、`qoder_endpoint`、`qoder_refresh`、`qoder_checkin` 四个工具。
-
----
 
 ## 运行数据在哪
 
@@ -138,8 +175,6 @@ AI 侧也能问：`qoder_status`、`qoder_endpoint`、`qoder_refresh`、`qoder_c
 | `CINDY_QODER_DATA` | `%APPDATA%\CindyGlobal\qoder-bridge` | 运行数据目录 |
 | `CINDY_QODER_CONTEXT` | （空，报 1M） | 设成 `default` 则报 200K |
 
----
-
 ## 开发与测试
 
 `test/` 下每个脚本都是独立的、可复跑的判据。**需要先装好并登录 Qoder CN**（要真读登录态、真打上游），只有 `host-guard` 是纯本地。
@@ -158,12 +193,10 @@ node test\wire-quirks.js        :: Cindy 的 /v1/v1 与 [1m] 怪癖 10 项
 node test\features.js           :: 签到 / 用量 / 日志 / 倍率 / 错误码 26 项
 ```
 
-想换模型：`node test\smoke-protocols.js <模型 id>`（默认 `qfmodel`，免费）。  
+想换模型：`node test\smoke-protocols.js <模型 id>`（默认 `qfmodel`，免费）。
 每个测试自己开临时目录与独立端口，不会踩到正在跑的实例。
 
 **为什么这些测试长这样**：它们都在防具体的线上事故 —— `host-guard` 防 Cindy 的代理转发时把 Host 头改成不带端口（那会让 claude-code 引擎 403）；`wire-quirks` 防 Base URL 带 `/v1` 被叠成 `/v1/v1/messages`、以及上下文选 1M 时 Cindy 把模型 id 编成 `qfmodel[1m]`；`e2e-brain` 防 `cindy.node.request` 的双层信封只剥一层（那会让面板显示「未登录 / 0 个 / —」）。
-
----
 
 ## 已知限制
 
@@ -174,19 +207,19 @@ node test\features.js           :: 签到 / 用量 / 日志 / 倍率 / 错误码
 - **额度重置时间拿不到。** Qoder 的 `/sash/api/v2/me/usage` 不返回这个字段（实测返回的键里没有），面板会显示「Qoder 接口没给」。
 - **依赖 Qoder 的内部接口。** 上游一改，插件就失效。这不是「长期稳定」的东西。
 
----
+## 免责声明
 
-## 风险与合规
+仅供个人学习研究使用，仅驱动使用者自己的 Qoder 账号在本机调用。使用者需遵守 Qoder 的服务条款，因使用本项目产生的后果由使用者自行承担。本项目与 Qoder、Cindy 均无关联，也未获得其授权或认可。
 
-请务必读完这一节再决定用不用。
+插件除「每日签到」外的所有请求都是**只读**的；签到是它唯一会对 Qoder 账号产生变更的操作（领取 Qoder 正在向**你自己的账号**发放的额度），它不会自动执行，每次都要手动点击。是否使用它、以及它是否符合 Qoder 当前的服务条款，请自行判断。
+
+具体说清楚风险：
 
 1. **这是逆向实现，不是官方接口。** 请求体里冒充 Qoder CLI 的身份（`session_type: "qodercli"`、`agent_id: "agent_common"` 等）去打它自己的网关。Qoder 的用户协议大概率不允许这类用法。
 2. **风险自负。** 可能导致账号被风控、配额被清零、甚至封号。作者不为此承担任何责任，也不提供任何保证。
 3. **不要用它做违反上游条款的事**，也不要拿它去绕过计费或配额限制 —— 它没有绕过任何东西，用的就是你自己账号的配额。
 4. **登录态只在本机内存里。** 插件不收集、不上传你的 token、聊天内容或任何账号信息。要审计的话，网络出口只有两个域名：`gateway.qoder.com.cn`、`openapi.qoder.com.cn`。
 5. `%APPDATA%\CindyGlobal\qoder-bridge\` 里会留运行日志和用量账本，**分享日志前先自己看一眼**。
-
----
 
 ## 许可
 
