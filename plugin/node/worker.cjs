@@ -7,7 +7,7 @@ const crypto = require('node:crypto');
 const http = require('node:http');
 const os = require('node:os');
 const { join } = require('node:path');
-const { existsSync, readFileSync, writeFileSync, mkdirSync, appendFileSync, statSync, renameSync } = require('node:fs');
+const { existsSync, readFileSync, writeFileSync, mkdirSync, appendFileSync, statSync, renameSync, unlinkSync } = require('node:fs');
 const { execFileSync } = require('node:child_process');
 const { createDecipheriv, createCipheriv, createHash, randomUUID, publicEncrypt, constants: cryptoConstants } = require('node:crypto');
 const { execFile } = require('node:child_process');
@@ -360,6 +360,7 @@ let lastUsage;
 
 const LOG_FILE = join(DATA_DIR, 'bridge.log');
 const LOG_MAX_BYTES = 2 * 1024 * 1024;
+const MAX_BODY_BYTES = 20 * 1024 * 1024;
 
 // Cindy 只把 node worker 的 stderr 挂到自己那儿，重启就没了。这里同时落一份盘，
 // 出问题能翻历史；超过 2MB 就轮转成 bridge.log.1，不会无限长。
@@ -543,7 +544,12 @@ async function refreshUsage(force) {
       payload = legacy.json.qoderUsage ?? legacy.json.data ?? legacy.json;
       source = 'quota/usage';
     } else {
-      lastUsage = { ...(lastUsage || {}), at: Date.now(), error: `HTTP ${presentation.status ?? '?'} ${legacy.status ?? ''}`.trim() };
+      // 拿不到额度时不能假装没事：lastQuota 保留旧值但打上 stale，
+      // 否则面板会一直显示上一次的「已用 843 / 2000」，看不出早就读失败了。
+      const why = `额度读取失败（HTTP ${presentation.status ?? '?'} / ${legacy.status ?? '?'}）`;
+      lastError = why;
+      lastUsage = { ...(lastUsage || {}), at: Date.now(), error: why };
+      if (lastQuota) lastQuota = { ...lastQuota, stale: true, staleReason: why };
       return lastUsage;
     }
   }
@@ -619,7 +625,12 @@ function checkinSummary(payload) {
   const campaign = checkinCampaignOf(payload);
   const benefit = campaign?.benefit;
   const amount = Number(benefit?.amount);
-  const target = campaign || list.find((c) => c && c.actionType === CLAIM_BENEFIT);
+  // 只看「窗口开着」的活动：Qoder 会提前把明天那轮 campaign 一起下发，
+  // 以前这里没判窗口，于是头一天晚上就显示「今天已签」，第二天 10 点反倒说签完了。
+  const now = Date.now();
+  const target = campaign || list.find((c) => c
+    && c.actionType === CLAIM_BENEFIT
+    && campaignWindowOpen(c, now));
   return {
     active: Boolean(target),
     claimable: Boolean(campaign),
@@ -723,6 +734,21 @@ function localDayKey(atMs) {
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
 }
 
+// 先写临时文件再 rename：rename 在同一分区上是原子的，进程被打断也不会留下
+// 半个 JSON 把整本账读废；顺带用 pid+随机后缀避免多个 worker 撞同一个临时名。
+function writeJsonAtomic(file, value) {
+  const tmp = `${file}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`;
+  writeFileSync(tmp, JSON.stringify(value, null, 1));
+  try { renameSync(tmp, file); }
+  catch (e) {
+    // Windows 上目标被别的进程短暂占住时 rename 会失败，退回直写再清临时文件
+    try { writeFileSync(file, JSON.stringify(value, null, 1)); } finally {
+      try { unlinkSync(tmp); } catch {}
+    }
+    if (e && e.code !== 'EPERM' && e.code !== 'EACCES' && e.code !== 'EBUSY') throw e;
+  }
+}
+
 function recordUsage(entry, wire, tokensIn, tokensOut) {
   try {
     const book = loadUsageBook();
@@ -743,7 +769,7 @@ function recordUsage(entry, wire, tokensIn, tokensOut) {
     while (keys.length > 60) delete book.days[keys.shift()];
 
     mkdirSync(DATA_DIR, { recursive: true });
-    writeFileSync(USAGE_FILE, JSON.stringify(book, null, 1));
+    writeJsonAtomic(USAGE_FILE, book);
   } catch (e) { log('usage write failed', e.message); }
 }
 
@@ -956,10 +982,25 @@ async function readBody(req) {
   const chunks = []; let total = 0;
   for await (const c of req) {
     total += c.length;
-    if (total > 20 * 1024 * 1024) throw new Error('请求体过大');
+    if (total > MAX_BODY_BYTES) {
+      const e = new Error('请求体过大（上限 20MB）');
+      e.httpStatus = 413;
+      throw e;
+    }
     chunks.push(c);
   }
   return Buffer.concat(chunks).toString('utf8');
+}
+
+// 请求体读不动时统一回：413 是体太大，其它（客户端提前断开）算 400。
+async function readJsonBody(req, res) {
+  try {
+    return { ok: true, value: JSON.parse(await readBody(req)) };
+  } catch (e) {
+    const status = e && e.httpStatus === 413 ? 413 : 400;
+    sendJson(res, status, { error: { message: e && e.httpStatus === 413 ? e.message : `请求体不是 JSON：${e.message}` } });
+    return { ok: false };
+  }
 }
 
 function isLoopbackAddr(a) {
@@ -1013,7 +1054,15 @@ async function handle(req, res) {
   // /v1/v1/messages → 我们回 404，Cindy 报「端点不存在（404）」。这里折叠重复的 /v1。
   let url = rawUrl;
   while (/^\/v1\/v1(\/|$)/.test(url)) url = url.slice(3);
+  // /healthz 是给端口探测和 Host 守卫用的探活口，不鉴权，所以只能回最小集。
+  // 以前这里直接吐 buildStatus()，把本地 API Token 一起给了任何能连 127.0.0.1 的进程。
   if (url === '/healthz' && req.method === 'GET') {
+    sendJson(res, 200, { ok: actualPort !== 0, port: actualPort, modelCount: models.length });
+    return;
+  }
+  // 完整状态（含 token、模型、额度、签到、本地用量）走这里，必须带 Bearer。
+  if ((url === '/status' || url === '/v1/status') && req.method === 'GET') {
+    if (!authOk(req)) { sendJson(res, 401, { error: { message: '本地 API Key 不对：面板上那串 Token 要一字不差地填进 Cindy 的 API Key 栏。' } }); return; }
     sendJson(res, 200, await buildStatus());
     return;
   }
@@ -1054,10 +1103,15 @@ async function handle(req, res) {
   }
   if ((url === '/v1/messages/count_tokens' || url === '/v1/messages/count_tokens/') && req.method === 'POST') {
     if (!authOk(req)) { sendJson(res, 401, { error: { message: '本地 API Key 不对：面板上那串 Token 要一字不差地填进 Cindy 的 API Key 栏。' } }); return; }
-    let body;
-    try { body = JSON.parse(await readBody(req)); }
-    catch (e) { sendJson(res, 400, { error: { message: `请求体不是 JSON：${e.message}` } }); return; }
-    const chat = adapters.anthropicRequestToChat(body);
+    const parsed = await readJsonBody(req, res);
+    if (!parsed.ok) return;
+    let chat;
+    try {
+      chat = adapters.anthropicRequestToChat(parsed.value);
+    } catch (e) {
+      sendJson(res, 400, { error: { message: `请求格式不对：${e.message}`, type: 'invalid_request_error' } });
+      return;
+    }
     sendJson(res, 200, { input_tokens: adapters.estimateTokens(chat.messages) });
     return;
   }
@@ -1079,32 +1133,41 @@ function normalizeModelKey(id) {
 }
 
 async function chatCompletions(req, res) {
-  let payload;
-  try { payload = JSON.parse(await readBody(req)); }
-  catch (e) { sendJson(res, 400, { error: { message: `请求体不是 JSON：${e.message}` } }); return; }
+  const parsed = await readJsonBody(req, res);
+  if (!parsed.ok) return;
+  const payload = parsed.value;
 
   const displayModel = normalizeModelKey(payload.model);
   const entry = models.find((m) => m.key === displayModel);
-  const cred = await refreshCredential(false);
-  if (!cred) { sendJson(res, 401, { error: { message: 'Qoder 未登录或凭证无法解密' } }); return; }
 
   const enableThinking = typeof payload.reasoning_effort === 'string' && payload.reasoning_effort
     ? payload.reasoning_effort !== 'off' && payload.reasoning_effort !== 'none'
     : entry?.isReasoning === true;
 
-  const request = {
-    model: displayModel,
-    messages: toQoderMessages(payload.messages || []),
-    tools: toQoderTools(payload.tools),
-    maxTokens: typeof payload.max_tokens === 'number' ? payload.max_tokens : undefined,
-    enableThinking,
-    alwaysThinking: entry?.alwaysThinking === true,
-    reasoningEffort: enableThinking
-      ? (typeof payload.reasoning_effort === 'string' && payload.reasoning_effort ? payload.reasoning_effort
-        : (entry?.effortLevels && entry.effortLevels.length ? entry.effortLevels[Math.min(2, entry.effortLevels.length - 1)] : undefined))
-      : undefined,
-    sessionId: typeof payload.user === 'string' ? payload.user : undefined,
-  };
+  // 输入校验（翻译）先做，畸形 tool 直接 400；再查凭证。三条协议顺序统一，
+  // 免得上游还没轮到判登录态就先抛 500。
+  let request;
+  try {
+    request = {
+      model: displayModel,
+      messages: toQoderMessages(payload.messages || []),
+      tools: toQoderTools(payload.tools),
+      maxTokens: typeof payload.max_tokens === 'number' ? payload.max_tokens : undefined,
+      enableThinking,
+      alwaysThinking: entry?.alwaysThinking === true,
+      reasoningEffort: enableThinking
+        ? (typeof payload.reasoning_effort === 'string' && payload.reasoning_effort ? payload.reasoning_effort
+          : (entry?.effortLevels && entry.effortLevels.length ? entry.effortLevels[Math.min(2, entry.effortLevels.length - 1)] : undefined))
+        : undefined,
+      sessionId: typeof payload.user === 'string' ? payload.user : undefined,
+    };
+  } catch (e) {
+    sendJson(res, 400, { error: { message: `请求格式不对：${e.message}`, type: 'invalid_request_error' } });
+    return;
+  }
+
+  const cred = await refreshCredential(false);
+  if (!cred) { sendJson(res, 401, { error: { message: 'Qoder 未登录或凭证无法解密' } }); return; }
 
   const wantStream = payload.stream !== false;
   const controller = new AbortController();
@@ -1256,11 +1319,16 @@ async function openUpstream(req, res, request, displayModel) {
 }
 
 async function anthropicMessages(req, res) {
-  let payload;
-  try { payload = JSON.parse(await readBody(req)); }
-  catch (e) { sendJson(res, 400, { error: { message: `请求体不是 JSON：${e.message}` } }); return; }
+  const parsed = await readJsonBody(req, res);
+  if (!parsed.ok) return;
 
-  const chat = adapters.anthropicRequestToChat(payload);
+  let chat;
+  try {
+    chat = adapters.anthropicRequestToChat(parsed.value);
+  } catch (e) {
+    sendJson(res, 400, { error: { message: `请求格式不对：${e.message}`, type: 'invalid_request_error' } });
+    return;
+  }
   const displayModel = normalizeModelKey(chat.model);
   const entry = models.find((m) => m.key === displayModel);
 
@@ -1270,15 +1338,21 @@ async function anthropicMessages(req, res) {
       ? (entry?.effortLevels && entry.effortLevels.length ? entry.effortLevels[Math.min(2, entry.effortLevels.length - 1)] : undefined)
       : undefined);
 
-  const request = {
-    model: displayModel,
-    messages: toQoderMessages(chat.messages),
-    tools: toQoderTools(chat.tools),
-    maxTokens: chat.maxTokens,
-    enableThinking: chat.thinking || entry?.isReasoning === true,
-    alwaysThinking: entry?.alwaysThinking === true,
-    reasoningEffort,
-  };
+  let request;
+  try {
+    request = {
+      model: displayModel,
+      messages: toQoderMessages(chat.messages),
+      tools: toQoderTools(chat.tools),
+      maxTokens: chat.maxTokens,
+      enableThinking: chat.thinking || entry?.isReasoning === true,
+      alwaysThinking: entry?.alwaysThinking === true,
+      reasoningEffort,
+    };
+  } catch (e) {
+    sendJson(res, 400, { error: { message: `请求格式不对：${e.message}`, type: 'invalid_request_error' } });
+    return;
+  }
 
   const up = await openUpstream(req, res, request, displayModel);
   if (!up.ok) return;
@@ -1291,28 +1365,39 @@ async function anthropicMessages(req, res) {
 }
 
 async function openaiResponses(req, res) {
-  let payload;
-  try { payload = JSON.parse(await readBody(req)); }
-  catch (e) { sendJson(res, 400, { error: { message: `请求体不是 JSON：${e.message}` } }); return; }
+  const parsed = await readJsonBody(req, res);
+  if (!parsed.ok) return;
 
-  const chat = adapters.responsesRequestToChat(payload);
+  let chat;
+  try {
+    chat = adapters.responsesRequestToChat(parsed.value);
+  } catch (e) {
+    sendJson(res, 400, { error: { message: `请求格式不对：${e.message}`, type: 'invalid_request_error' } });
+    return;
+  }
   const displayModel = normalizeModelKey(chat.model);
   const entry = models.find((m) => m.key === displayModel);
 
   const asked = chat.reasoningEffort;
   const enableThinking = asked ? asked !== 'off' && asked !== 'none' : entry?.isReasoning === true;
 
-  const request = {
-    model: displayModel,
-    messages: toQoderMessages(chat.messages),
-    tools: toQoderTools(chat.tools),
-    maxTokens: chat.maxTokens,
-    enableThinking,
-    alwaysThinking: entry?.alwaysThinking === true,
-    reasoningEffort: enableThinking
-      ? (asked || (entry?.effortLevels && entry.effortLevels.length ? entry.effortLevels[Math.min(2, entry.effortLevels.length - 1)] : undefined))
-      : undefined,
-  };
+  let request;
+  try {
+    request = {
+      model: displayModel,
+      messages: toQoderMessages(chat.messages),
+      tools: toQoderTools(chat.tools),
+      maxTokens: chat.maxTokens,
+      enableThinking,
+      alwaysThinking: entry?.alwaysThinking === true,
+      reasoningEffort: enableThinking
+        ? (asked || (entry?.effortLevels && entry.effortLevels.length ? entry.effortLevels[Math.min(2, entry.effortLevels.length - 1)] : undefined))
+        : undefined,
+    };
+  } catch (e) {
+    sendJson(res, 400, { error: { message: `请求格式不对：${e.message}`, type: 'invalid_request_error' } });
+    return;
+  }
 
   const up = await openUpstream(req, res, request, displayModel);
   if (!up.ok) return;
@@ -1394,7 +1479,13 @@ async function startServer() {
     }
   }
 
-  if (!bound) throw new Error(`端口 ${PREFERRED_PORT}..${PREFERRED_PORT + 19} 都被占用`);
+  if (!bound) {
+    // 一个端口都没抢到：必须把 server 放回 null，否则下一次 RPC 的 `if (!server) await boot()`
+    // 看到的是这个已经废掉的 http.Server 实例，于是永远不再重试，进程变成僵尸
+    // （RPC 还在答，但 actualPort 是 0，客户端一直连不上）。
+    server = null;
+    throw new Error(`端口 ${PREFERRED_PORT}..${PREFERRED_PORT + 19} 都被占用`);
+  }
   actualPort = bound;
   saveState({ port: actualPort, token });
   log(`已在 127.0.0.1:${actualPort} 监听`);
@@ -1425,7 +1516,8 @@ async function buildStatus() {
   }
   const scheduled = await checkinScheduleForCredential(cred);
   return {
-    ok: true,
+    // 端口没绑上就别报 ok：以前这里恒 true，RPC 拿到的是「一切正常，port 0」。
+    ok: actualPort !== 0,
     signedIn: Boolean(cred && cred.expired !== true),
     user: cred?.name || (cred?.email ?? '') || '',
     expired: cred?.expired === true,

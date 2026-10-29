@@ -177,7 +177,7 @@ AI 侧也能问：`qoder_status`、`qoder_endpoint`、`qoder_refresh`、`qoder_c
 
 ## 开发与测试
 
-`test/` 下每个脚本都是独立的、可复跑的判据。**需要先装好并登录 Qoder CN**（要真读登录态、真打上游），只有 `host-guard` 是纯本地。
+`test/` 下每个脚本都是独立的、可复跑的判据。**需要先装好并登录 Qoder CN**（要真读登录态、真打上游），只有 `host-guard` 是纯本地。没登录时 `features` 与 `e2e-panel` 会把依赖登录态的用例打 `--` / `SKIP` 跳过，不会崩，但那样等于没验到。
 
 ```bat
 cd plugin && npm run verify     :: 清单静态校验
@@ -190,13 +190,26 @@ node test\e2e-brain.js          :: 面板 ↔ 电子脑真实总线 13 项
 node test\smoke-protocols.js    :: 三条协议形状 19 项
 node test\smoke-tools.js        :: 三条协议的 tool call 11 项
 node test\wire-quirks.js        :: Cindy 的 /v1/v1 与 [1m] 怪癖 10 项
-node test\features.js           :: 签到 / 用量 / 日志 / 倍率 / 错误码 26 项
+node test\features.js           :: 签到 / 用量 / 日志 / 倍率 / 错误码 / 输入校验 42 项
 ```
 
 想换模型：`node test\smoke-protocols.js <模型 id>`（默认 `qfmodel`，免费）。
 每个测试自己开临时目录与独立端口，不会踩到正在跑的实例。
 
 **为什么这些测试长这样**：它们都在防具体的线上事故 —— `host-guard` 防 Cindy 的代理转发时把 Host 头改成不带端口（那会让 claude-code 引擎 403）；`wire-quirks` 防 Base URL 带 `/v1` 被叠成 `/v1/v1/messages`、以及上下文选 1M 时 Cindy 把模型 id 编成 `qfmodel[1m]`；`e2e-brain` 防 `cindy.node.request` 的双层信封只剥一层（那会让面板显示「未登录 / 0 个 / —」）。
+
+## 本地端点
+
+| 路径 | 鉴权 | 说明 |
+|---|---|---|
+| `GET /healthz` | 否 | 探活，只回 `{ok, port, modelCount}`。不鉴权，所以只给这三个字段——本地 Token 不放这儿 |
+| `GET /status`（`/v1/status` 同义） | 是 | 完整状态：账号、模型、额度、签到、本地用量、日志路径 |
+| `GET /v1/models` | 是 | 模型目录（含上下文窗口、倍率、推理档位） |
+| `POST /v1/chat/completions` | 是 | OpenAI Chat 协议 |
+| `POST /v1/messages`、`POST /v1/messages/count_tokens` | 是 | Anthropic Messages 协议 |
+| `POST /v1/responses` | 是 | OpenAI Responses 协议 |
+
+鉴权就是 `Authorization: Bearer <面板上那串 Token>`。
 
 ## 已知限制
 

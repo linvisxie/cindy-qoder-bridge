@@ -123,15 +123,22 @@ function makeElement(id) {
 
   expect('唤醒 fetch 打到 cindy-ghost://qoder-bridge/wake', fetches[0], 'cindy-ghost://qoder-bridge/wake');
   expect('标题', el.title.textContent, 'Qoder 桥');
-  expect('账号', el.user.textContent, status.user);
-  expect('模型数', el.modelCount.textContent, status.modelCount + ' 个');
-  expect('端口', el.port.textContent, (v) => String(v) === String(status.port));
-  expect('额度含已用', el.quota.textContent, (v) => /已用 \d+ \/ \d+/.test(v));
+  // 未登录的机器上（没有 Qoder CN 客户端）账号/模型这些全空，逐项硬断言只会误报。
+  // 这里把「必须依赖登录态」的几项在未登录时降级成跳过，而不是判失败（issue #7）。
+  const signedIn = status.signedIn === true;
+  const guarded = (name, got, want) => {
+    if (!signedIn) { console.log(`SKIP  ${name}（未登录 Qoder，跳过）`); return; }
+    expect(name, got, want);
+  };
+  guarded('账号', el.user.textContent, status.user);
+  guarded('模型数', el.modelCount.textContent, status.modelCount + ' 个');
+  guarded('额度含已用', el.quota.textContent, (v) => /已用 \d+ \/ \d+/.test(v));
   const firstModelId = (status.models && status.models[0] && status.models[0].id) || '';
-  expect('模型列表已渲染（不再显示「正在叫醒插件」）', el.models.innerHTML,
+  guarded('模型列表已渲染（不再显示「正在叫醒插件」）', el.models.innerHTML,
     (v) => firstModelId !== '' && v.includes(firstModelId) && !v.includes('正在叫醒'));
-  expect('BaseURL 已填', el.baseUrl.textContent, status.baseUrl);
-  expect('Token 已填', el.token.textContent, status.token);
+  guarded('BaseURL 已填', el.baseUrl.textContent, status.baseUrl);
+  guarded('Token 已填', el.token.textContent, status.token);
+  expect('端口', el.port.textContent, (v) => String(v) === String(status.port));
   expect('绿灯', el.dot.className, 'dot ok');
 
   let failed = 0;

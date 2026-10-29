@@ -176,7 +176,13 @@ if (channel) {
     if (!data || data.__panel !== true || typeof data.reqId !== 'string') return;
     if (seen.has(data.reqId)) return;          // 面板会重发，按 reqId 去重
     seen.add(data.reqId);
-    if (seen.size > 200) seen.clear();
+    // 只淘汰最早的那条，别一次清空：清空后旧 reqId 再重发会被当成新请求，
+    // 对签到这种有副作用的动作就是重复提交（靠上游幂等兜着，但没必要赌）。
+    while (seen.size > 200) {
+      const oldest = seen.values().next().value;
+      if (oldest === undefined) break;
+      seen.delete(oldest);
+    }
 
     const send = (value) => {
       try { channel.postMessage({ __brain: true, reqId: data.reqId, value }); } catch {}

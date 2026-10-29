@@ -4,6 +4,27 @@
 
 ---
 
+## 0.1.10
+
+处理一轮代码审计报出来的问题。修的都是「出错时表现错了」这一类，正常路径的行为没动：
+
+- **`/healthz` 不再泄露 API Key**：以前它直接吐完整的 `buildStatus()`，任何能连上 `127.0.0.1` 的进程都能拿到本地 Token。现在只回 `{ok, port, modelCount}` 三个字段（端口探测和 Host 守卫要的就是这三个），完整状态挪到需要鉴权的 `GET /status`（`/v1/status` 同义）。
+- **端口全占后不再变僵尸**：起监听失败时把 `server` 置回 `null`，否则后续 RPC 看到的是个死对象、`if (!server) await boot()` 不再触发。同时 `buildStatus()` 在没绑上端口时不再谎报 `ok: true`。
+- **请求体错误的状态码**：超过 20 MB 回 `413`（以前落进通用 catch 变 500）；JSON 坏掉、请求体为空回 `400`，并说明哪里不对。
+- **三条协议统一先校验后鉴权**：`chat` / `messages` / `responses` / `count_tokens` 现在都是「解析 → 翻译 → 查登录态」，畸形 tool 输入一律 `400 请求格式不对：…`，而不是没登录时先报 401、登录后报 500 各说各话。
+- **Responses 不再假装成功**：按 `finish_reason` 给状态——`length` → `incomplete` + `incomplete_details.reason: "max_output_tokens"`，`content_filter` → `failed`，其余 `completed`。流式和非流式都改了。
+- **Anthropic 流的事件顺序**：工具块之后再来文本时，先 `content_block_stop` 关掉工具块再开文本块，不会出现两个块叠着开。
+- **Anthropic 工具参数不再静默变空**：`arguments` 解析失败时保留原文（`__unparsed_arguments`），不当成 `{}` 调用；`tool_result` 缺 `tool_use_id`、`function_call_output` 缺 `call_id` 直接报错，不静默丢。
+- **本地账本原子写**：`usage.json` 先写临时文件再 `rename`，并发写不会互相截断；Windows 上 rename 偶发被占用时退回复写并清理临时文件。
+- **额度读取失败会说了**：失败时把原因写进 `lastError`，并在 `lastQuota` 上标 `stale` / `staleReason`，面板不再默默显示旧数字。
+- **签到不再误判**：「今天已签」现在要求那轮活动窗口真的开着——Qoder 会提前下发明天那轮，以前头天晚上就会显示已签。
+- **面板去重表不再全清**：`reqId` 去重从「超 200 条整体清空」改成淘汰最早一条。
+- **测试能离线跑了**：`test/features.js` 从 `state.json` 取 token 打 `/status`，未登录时自动跳过需要登录态的用例并打印 `--`（以前模型列表为空会 `TypeError` 崩掉）；`test/e2e-panel.js` 同理，未登录时打 `SKIP` 而不判失败。
+
+测试：host-guard 13、features 42、smoke-protocols 19、smoke-tools 11、wire-quirks 10、e2e-package 21、e2e-panel 10、e2e-brain 13，全绿。
+
+---
+
 ## 0.1.9
 
 补齐七件「和 DSH 插件对齐」的体验：
