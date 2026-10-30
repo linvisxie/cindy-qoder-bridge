@@ -102,7 +102,13 @@ function readState(dataDir) {
   ok('status 带 localUsage', status.localUsage !== undefined && status.localUsage.today !== undefined);
   ok('status 带 logFile', typeof status.logFile === 'string' && status.logFile.endsWith('bridge.log'), status.logFile);
   ok('checkin 带下次开轮时间', Number.isFinite(Number(status.checkin.nextAt)), new Date(status.checkin.nextAt).toISOString());
-  ok('额度重置/会员到期字段存在（可为空）', 'resetAt' in (status.usage || {}) || 'expiresAt' in (status.usage || {}));
+  // 未登录时 refreshUsage 走的是 error 分支，只写 { at, error }，压根没有这两个键，
+  // 所以只能在登录态下硬断言，否则离线跑测试必挂（issue #8）。
+  if (status.signedIn) {
+    ok('额度重置/会员到期字段存在（可为空）', 'resetAt' in (status.usage || {}) || 'expiresAt' in (status.usage || {}));
+  } else {
+    skip('额度重置/会员到期字段存在（可为空）', '未登录 Qoder，用量接口拿不到额度/会员字段');
+  }
 
   console.log('\n--- 日志落盘 ---');
   const logPath = path.join(dataDir, 'bridge.log');
@@ -116,8 +122,10 @@ function readState(dataDir) {
   const modelsRes = await request('GET', '/v1/models', undefined, token);
   let models = [];
   try { models = (JSON.parse(modelsRes.text).data) || []; } catch {}
-  ok('/v1/models 可用', modelsRes.status === 200 && models.length > 0, models.length + ' 个');
+  // 200 是接口能用，跟登没登录无关，硬断言；有模型才继续（issue #8）。
+  ok('/v1/models 可用', modelsRes.status === 200, modelsRes.status);
   if (!models.length) {
+    skip('模型列表非空', '/v1/models 返回 0 个（多半是没登录 Qoder）');
     skip('倍率/档位相关断言', '/v1/models 空（多半是没登录 Qoder）');
   } else {
     const withFactor = models.filter((m) => m.price_factor !== undefined);

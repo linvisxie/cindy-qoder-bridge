@@ -443,13 +443,15 @@ function responsesRequestToChat(body) {
 // 上游的 finish_reason 以前被算出来就扔了，所有响应一律报 completed。
 // 后果：被 max_tokens 截断的半截回答，在客户端看起来是「正常说完的」，
 // 调工具的会被当成模型自己不想调了，读代码的会以为文件就这么长。
-// 这里按 OpenAI Responses 的语义映射：length → incomplete，content_filter → failed。
+// 按 OpenAI Responses 的语义映射：截断（length）和内容策略中断（content_filter）
+// 都是「产出被提前掐掉」，归 incomplete，区别只在 incomplete_details.reason。
+// response.failed 留给「上游直接报错、压根没产出」——见 writeResponsesStream 的 catch。
 function responsesStatusOf(finish) {
   if (finish === 'length') {
     return { status: 'incomplete', incomplete_details: { reason: 'max_output_tokens' } };
   }
   if (finish === 'content_filter') {
-    return { status: 'failed', error: { code: 'content_filter', message: '上游按内容策略截断了这次回答' } };
+    return { status: 'incomplete', incomplete_details: { reason: 'content_filter' } };
   }
   return { status: 'completed' };
 }

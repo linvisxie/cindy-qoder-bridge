@@ -4,6 +4,34 @@
 
 ---
 
+## 0.1.12
+
+处理代码审查（issue #8）报的一轮测试与状态语义问题。
+
+**一、没登录 Qoder 的机器上跑测试不再误报失败**
+
+以前在没装/没登录 Qoder CN 的机器上跑 `node test/features.js` 是 31 通过 2 失败、`node test/e2e-panel.js` 是 3/4 通过。失败项跟功能无关，全是「依赖登录态却硬断言」：
+
+- `features.js` 的「额度重置/会员到期字段存在（可为空）」——未登录时 `refreshUsage` 走的是错误分支，只写 `{at, error}`，压根不会写 `resetAt` / `expiresAt` 这两个键。现在未登录打 `--` 跳过。
+- `features.js` 的「/v1/models 可用」——原来把「返回 200」和「模型数 > 0」写进同一条断言，未登录 0 个模型必挂。现在拆开：200 硬断言（接口能用跟登没登录无关），模型列表非空在 0 个时打 `--` 跳过。
+- `e2e-panel.js` 的「绿灯」——面板的指示灯本来就是登录绿、未登录红（`panel.js` 里 `signedIn ? 'ok' : 'err'`，未登录给红点才是正确表现），测试却硬断言 `dot ok`。现在断言改成「指示灯状态跟登录态一致」。
+
+**二、Responses 的子项状态跟整体对不上**
+
+`finish_reason` 是 `content_filter` 时，以前顶层报 `failed`（带 `error.code`），子项却因为 `itemStatus` 只有两档而标成 `incomplete`，同一个响应里自相矛盾。
+
+审查建议的修法是「failed 时子项跟随 failed」，但这条**没法照抄**：OpenAI Responses 的 output 项（`message` / `function_call`）`status` 枚举只有 `in_progress` / `completed` / `incomplete`，`failed` 只属于顶层 `Response`。子项标 `failed` 会产出不合 schema 的响应。
+
+所以改的是顶层：内容策略中断和 `max_tokens` 截断一样，本质都是「产出被提前掐掉」，归 `incomplete`，区别只在 `incomplete_details.reason`（`max_output_tokens` / `content_filter`）。这样顶层与子项自洽，`response.incomplete` 事件也带上了 `reason`。`response.failed` 仍然保留给「上游直接报错、压根没产出」那条路径（`upstream_error`）。
+
+**三、补一套离线单元测试**
+
+新增 `test/responses-status.js`（19 项）：不开 worker、不联网、不需要登录，直接把假的 chat chunk 喂给 `responsesMessage` 和 `writeResponsesStream`，检查三种 `finish_reason` 下顶层 status、`incomplete_details.reason`、每个子项 status，以及流式发的终止事件类型。测试里专门有一条「子项 status 只用合法枚举」，防止以后有人照 issue 的建议把 `failed` 写进子项。
+
+变化幅度：`features.js` 42 项全绿、`e2e-panel.js` 10 项全绿（登录态下语义不变），新增的 19 项全绿。
+
+---
+
 ## 0.1.11
 
 修一个 codex 引擎必踩的坑：**助手先说一句话、紧接着发起函数调用，整条链路就断**。

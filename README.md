@@ -177,13 +177,14 @@ AI 侧也能问：`qoder_status`、`qoder_endpoint`、`qoder_refresh`、`qoder_c
 
 ## 开发与测试
 
-`test/` 下每个脚本都是独立的、可复跑的判据。**需要先装好并登录 Qoder CN**（要真读登录态、真打上游），只有 `host-guard` 是纯本地。没登录时 `features` 与 `e2e-panel` 会把依赖登录态的用例打 `--` / `SKIP` 跳过，不会崩，但那样等于没验到。
+`test/` 下每个脚本都是独立的、可复跑的判据。多数脚本**需要先装好并登录 Qoder CN**（要真读登录态、真打上游）；`host-guard`、`responses-status`、`e2e-package` 是纯本地的。没登录时 `features` 与 `e2e-panel` 会把依赖登录态的用例打 `--` / `SKIP` 跳过，不会崩，但那样等于没验到。
 
 ```bat
 cd plugin && npm run verify     :: 清单静态校验
 cd plugin && npm run pack       :: 打包
 
 node test\host-guard.js         :: Host 守卫 13 项（纯本地，不需要登录）
+node test\responses-status.js   :: Responses 状态映射 19 项（纯本地，不需要登录）
 node test\e2e-package.js        :: 包端到端 21 项（解包 → 起 worker → 真对话 → 三条协议）
 node test\e2e-panel.js          :: 面板脚本 10 项
 node test\e2e-brain.js          :: 面板 ↔ 电子脑真实总线 13 项
@@ -196,7 +197,7 @@ node test\features.js           :: 签到 / 用量 / 日志 / 倍率 / 错误码
 想换模型：`node test\smoke-protocols.js <模型 id>`（默认 `qfmodel`，免费）。
 每个测试自己开临时目录与独立端口，不会踩到正在跑的实例。
 
-**为什么这些测试长这样**：它们都在防具体的线上事故 —— `host-guard` 防 Cindy 的代理转发时把 Host 头改成不带端口（那会让 claude-code 引擎 403）；`wire-quirks` 防 Base URL 带 `/v1` 被叠成 `/v1/v1/messages`、以及上下文选 1M 时 Cindy 把模型 id 编成 `qfmodel[1m]`；`e2e-brain` 防 `cindy.node.request` 的双层信封只剥一层（那会让面板显示「未登录 / 0 个 / —」）。
+**为什么这些测试长这样**：它们都在防具体的线上事故 —— `host-guard` 防 Cindy 的代理转发时把 Host 头改成不带端口（那会让 claude-code 引擎 403）；`wire-quirks` 防 Base URL 带 `/v1` 被叠成 `/v1/v1/messages`、以及上下文选 1M 时 Cindy 把模型 id 编成 `qfmodel[1m]`；`e2e-brain` 防 `cindy.node.request` 的双层信封只剥一层（那会让面板显示「未登录 / 0 个 / —」）；`responses-status` 防 Responses 被截断或内容策略掐断时顶层与子项状态各说各话，也钉死「子项 status 只能是 `in_progress` / `completed` / `incomplete`」——`failed` 只属于顶层 `Response`。
 
 ## 本地端点
 

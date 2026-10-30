@@ -139,7 +139,9 @@ function makeElement(id) {
   guarded('BaseURL 已填', el.baseUrl.textContent, status.baseUrl);
   guarded('Token 已填', el.token.textContent, status.token);
   expect('端口', el.port.textContent, (v) => String(v) === String(status.port));
-  expect('绿灯', el.dot.className, 'dot ok');
+  // 面板的指示灯本来就是登录绿、未登录红（panel.js 里 signedIn ? ok : err），
+  // 未登录时硬断言 dot ok 等于让测试和实现互相打脸（issue #8）。
+  expect('指示灯状态跟登录态一致', el.dot.className, signedIn ? 'dot ok' : 'dot err');
 
   let failed = 0;
   for (const c of checks) {
