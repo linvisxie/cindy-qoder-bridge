@@ -4,6 +4,28 @@
 
 ---
 
+## 0.1.13
+
+修「模型选择器被撑开，整排控件被推离麦克风」。
+
+**现象**：Cindy 输入框右边本来贴着麦克风，装了 Qoder 桥之后模型选择器往左挪了一大截，模型名还被省略号截断。
+
+**原因**：把推理档位拼进了模型显示名。实测长度 `Qwen3.8-Max · x0.2 · 档位 xhigh/low/medium` = 40 字符、`Kimi-K2.8-Preview · x0.8 · 档位 high/low/max` = 42 字符。Cindy 的模型选择器按钮是按名字宽度撑开的，名字一长，整排控件就被往左挤。而档位本来就通过 `/v1/models` 的 `reasoning.supported_efforts` 交给 Cindy，由它自己渲染成独立的下拉控件（界面上显示为「π 低」这类标记），名字里再写一遍是纯冗余。
+
+**改法**：`modelLabel()` 去掉「 · 档位 …」那一段，只留倍率。
+
+```js
+function modelLabel(m) {
+  const f = m.priceFactor;
+  const tag = f === 0 ? ' · 免费' : typeof f === 'number' ? ` · x${f}` : '';
+  return `${m.name}${tag}`;
+}
+```
+
+倍率保留，因为 Cindy 的自定义供应商不解析 `cost` / `displayPricing` 字段，倍率只能塞名字里，而且它短。
+
+**效果**：最长模型名从 42 字符降到 25 字符（`MiniMax-M3.1-Flash · x0.1`），选择器回到麦克风旁边。档位功能一点没少 —— `/v1/models` 的 `reasoning.supported_efforts` 照旧（`qmodel_38max` / `qfmodel` → `xhigh/low/medium`，`dmodel` → `high/max`，`auto` → 空）。
+
 ## 0.1.12
 
 处理代码审查（issue #8）报的一轮测试与状态语义问题。

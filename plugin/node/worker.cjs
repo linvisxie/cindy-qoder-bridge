@@ -1039,11 +1039,12 @@ function authOk(req) {
 
 // 面板与 /v1/models 共用的模型标题：倍率必须一眼看见，Cindy 的自定义供应商不解析
 // cost / displayPricing（parseModelsListResponse 里没有这两个字段），只能塞名字里。
+// 档位不进名字——Cindy 的模型选择器是按名字宽度撑开的，名字一长整排控件就被推离麦克风。
+// 档位本来就由 reasoning.supported_efforts 交给 Cindy 渲染成独立的下拉，面板里也有单独一列。
 function modelLabel(m) {
   const f = m.priceFactor;
   const tag = f === 0 ? ' · 免费' : typeof f === 'number' ? ` · x${f}` : '';
-  const eff = m.effortLevels && m.effortLevels.length ? ` · 档位 ${m.effortLevels.join('/')}` : '';
-  return `${m.name}${tag}${eff}`;
+  return `${m.name}${tag}`;
 }
 
 async function handle(req, res) {
