@@ -173,6 +173,36 @@
     setTimeout(() => { btn.textContent = '立即签到'; load(); }, 2500);
   });
 
+  $('checkUpdate').addEventListener('click', async () => {
+    const btn = $('checkUpdate');
+    const msg = $('updateMsg');
+    btn.disabled = true; btn.textContent = '检查中…';
+    const r = await ask('checkUpdate', 30000);
+    btn.disabled = false;
+    if (!r || r.error) {
+      btn.textContent = '检查更新';
+      msg.hidden = false;
+      msg.textContent = '检查失败：' + ((r && r.error) || '没有响应');
+      return;
+    }
+    msg.hidden = false;
+    if (!r.hasUpdate) {
+      btn.textContent = '检查更新';
+      msg.textContent = '已是最新版本（' + (r.current || '当前') + '）';
+      return;
+    }
+    msg.textContent = '发现新版本 ' + r.latest + '（当前 ' + r.current + '），点「安装」会下载并替换，插件随后自动重启。';
+    btn.textContent = '安装 ' + r.latest;
+    // 装完进程会退出重启，所以第二次点击才真装，避免误触。
+    btn.onclick = async () => {
+      btn.disabled = true; btn.textContent = '安装中…';
+      const a = await ask('applyUpdate', 120000);
+      btn.disabled = false;
+      msg.textContent = a && a.applied ? a.message : ('安装失败：' + ((a && (a.error || a.message)) || '没有响应'));
+      btn.textContent = '检查更新';
+    };
+  });
+
   load();
   setInterval(load, 15000);
 })();

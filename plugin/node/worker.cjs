@@ -6,11 +6,13 @@
 const crypto = require('node:crypto');
 const http = require('node:http');
 const os = require('node:os');
+const zlib = require('node:zlib');
 const { join } = require('node:path');
 const { existsSync, readFileSync, writeFileSync, mkdirSync, appendFileSync, statSync, renameSync, unlinkSync } = require('node:fs');
 const { execFileSync } = require('node:child_process');
 const { createDecipheriv, createCipheriv, createHash, randomUUID, publicEncrypt, constants: cryptoConstants } = require('node:crypto');
 const { execFile } = require('node:child_process');
+const { spawn } = require('node:child_process');
 const adapters = require('./adapters.cjs');
 
 // ============================================================
@@ -1607,6 +1609,177 @@ async function buildStatus() {
 }
 
 // ============================================================
+// 自查更新（GitHub Releases）
+// ============================================================
+//
+// 为什么走 GitHub API 而不是 gh CLI：gh 要登录态、要看代理配没配对，
+// 而 release 的 REST 接口匿名就能读（公开仓库），node 自带 fetch 直接打就行。
+// 这里只做「检查 + 下载 + 交给一个独立脚本去替换」，不在本进程里改自己的文件 ——
+// Windows 上正在运行的文件会被锁，硬覆盖一定失败。
+
+const UPDATE_REPO = process.env.QODER_BRIDGE_REPO || 'linvisxie/cindy-qoder-bridge';
+const UPDATE_API = `https://api.github.com/repos/${UPDATE_REPO}/releases/latest`;
+const UPDATE_DIR = join(DATA_DIR, 'update');
+const INSTALL_DIR = join(__dirname, '..');
+
+function versionParts(v) {
+  return String(v || '').replace(/^v/i, '').split('.').map((x) => Number(x.replace(/\D/g, '')) || 0);
+}
+
+// 比版本：a 比 b 新返回正数，相同 0，旧负数。逐段比，缺的段按 0 算。
+function compareVersion(a, b) {
+  const x = versionParts(a);
+  const y = versionParts(b);
+  const n = Math.max(x.length, y.length);
+  for (let i = 0; i < n; i++) {
+    const d = (x[i] || 0) - (y[i] || 0);
+    if (d !== 0) return d;
+  }
+  return 0;
+}
+
+function currentVersion() {
+  try {
+    return String(JSON.parse(readFileSync(join(INSTALL_DIR, 'ghost.json'), 'utf8')).version || '');
+  } catch {
+    return '';
+  }
+}
+
+async function checkUpdate() {
+  const mine = currentVersion();
+  const res = await fetch(UPDATE_API, {
+    headers: { 'User-Agent': 'qoder-bridge', Accept: 'application/vnd.github+json' },
+    signal: AbortSignal.timeout(15000),
+  });
+  if (!res.ok) throw new Error(`查更新失败：GitHub 返回 HTTP ${res.status}`);
+  const j = await res.json();
+  const latest = String(j.tag_name || '').replace(/^v/i, '');
+  const asset = (Array.isArray(j.assets) ? j.assets : []).find((a) => typeof a.name === 'string' && a.name.endsWith('.cindy'));
+  return {
+    current: mine,
+    latest,
+    hasUpdate: Boolean(latest) && compareVersion(latest, mine) > 0,
+    htmlUrl: typeof j.html_url === 'string' ? j.html_url : '',
+    notes: typeof j.body === 'string' ? j.body.slice(0, 2000) : '',
+    asset: asset ? { name: asset.name, size: asset.size, url: asset.browser_download_url } : undefined,
+  };
+}
+
+// 极简 zip 读取：.cindy 就是普通 zip，只需要「列条目 + 解到目录」这一件事。
+// （test/_unzip.cjs 是同一份逻辑，但测试目录不会被打进插件包，所以这里独立一份。）
+function readZipEntries(buf) {
+  let eocd = -1;
+  const minPos = Math.max(0, buf.length - 22 - 65535);
+  for (let i = buf.length - 22; i >= minPos; i--) {
+    if (buf.readUInt32LE(i) === 0x06054b50) { eocd = i; break; }
+  }
+  if (eocd < 0) throw new Error('不是有效的 zip：找不到中央目录结尾');
+  const count = buf.readUInt16LE(eocd + 10);
+  let off = buf.readUInt32LE(eocd + 16);
+  const out = [];
+  for (let n = 0; n < count; n++) {
+    if (buf.readUInt32LE(off) !== 0x02014b50) throw new Error('中央目录条目签名不对');
+    const method = buf.readUInt16LE(off + 10);
+    const compSize = buf.readUInt32LE(off + 20);
+    const nameLen = buf.readUInt16LE(off + 28);
+    const extraLen = buf.readUInt16LE(off + 30);
+    const commentLen = buf.readUInt16LE(off + 32);
+    const localOff = buf.readUInt32LE(off + 42);
+    const name = buf.toString('utf8', off + 46, off + 46 + nameLen);
+    if (buf.readUInt32LE(localOff) !== 0x04034b50) throw new Error('本地文件头签名不对：' + name);
+    const lNameLen = buf.readUInt16LE(localOff + 26);
+    const lExtraLen = buf.readUInt16LE(localOff + 28);
+    const dataStart = localOff + 30 + lNameLen + lExtraLen;
+    const raw = buf.subarray(dataStart, dataStart + compSize);
+    let data;
+    if (method === 0) data = raw;
+    else if (method === 8) data = zlib.inflateRawSync(raw);
+    else throw new Error(`不支持的压缩方式 ${method}：${name}`);
+    out.push({ name, data });
+    off += 46 + nameLen + extraLen + commentLen;
+  }
+  return out;
+}
+
+function extractZipTo(buf, targetDir) {
+  const names = [];
+  for (const e of readZipEntries(buf)) {
+    const rel = e.name.replace(/\\/g, '/');
+    if (rel.startsWith('/') || rel.split('/').includes('..')) throw new Error('包里有不安全路径：' + e.name);
+    const dest = join(targetDir, ...rel.split('/'));
+    mkdirSync(require('node:path').dirname(dest), { recursive: true });
+    writeFileSync(dest, e.data);
+    names.push(rel);
+  }
+  return names;
+}
+
+/**
+ * 下载新版本、解到暂存目录，然后交给一个独立的 PowerShell 脚本去替换安装目录。
+ *
+ * 为什么必须交给独立脚本：Windows 上正在运行的 .js 文件被进程锁着，本进程覆盖自己
+ * 一定会 EBUSY／EPERM。那个脚本等本进程退出后再动文件，Cindy 随后会把 worker 重新
+ * 拉起来（实测约 24 秒），起来时读到的就是新文件。
+ * 替换前先整目录备份成 `<安装目录>.bak-<旧版本>`，拷坏了还能手工还原。
+ */
+async function applyUpdate() {
+  const info = await checkUpdate();
+  if (!info.hasUpdate) return { ...info, applied: false };
+  if (!info.asset) throw new Error('最新 release 里没有 .cindy 包，无法更新');
+
+  mkdirSync(UPDATE_DIR, { recursive: true });
+  const pkgPath = join(UPDATE_DIR, `${info.asset.name}`);
+  const res = await fetch(info.asset.url, {
+    headers: { 'User-Agent': 'qoder-bridge' },
+    signal: AbortSignal.timeout(120000),
+  });
+  if (!res.ok) throw new Error(`下载新版本失败：HTTP ${res.status}`);
+  const bytes = Buffer.from(await res.arrayBuffer());
+  writeFileSync(pkgPath, bytes);
+
+  const stageDir = join(UPDATE_DIR, `stage-${info.latest}`);
+  extractZipTo(bytes, stageDir);
+  if (!existsSync(join(stageDir, 'ghost.json'))) throw new Error('新包解出来没有 ghost.json，放弃更新');
+
+  const scriptPath = join(UPDATE_DIR, 'apply-update.ps1');
+  const backup = `${INSTALL_DIR}.bak-${info.current}`;
+  // 单引号里再转义单引号，PowerShell 字符串才不会被路径里的空格/引号截断。
+  const q = (s) => `'${String(s).replace(/'/g, "''")}'`;
+  const script = [
+    `$ErrorActionPreference = 'Stop'`,
+    `$root = ${q(INSTALL_DIR)}`,
+    `$stage = ${q(stageDir)}`,
+    `$backup = ${q(backup)}`,
+    `$oldPid = ${process.pid}`,
+    `try { Wait-Process -Id $oldPid -Timeout 60 -ErrorAction SilentlyContinue } catch {}`,
+    `Start-Sleep -Milliseconds 300`,
+    `if (-not (Test-Path $backup)) { Copy-Item $root $backup -Recurse -Force }`,
+    `Copy-Item (Join-Path $stage '*') $root -Recurse -Force`,
+    `Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue`,
+  ].join('\r\n');
+  writeFileSync(scriptPath, script, 'utf8');
+
+  const child = spawn('powershell.exe', ['-NoProfile', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', scriptPath], {
+    detached: true, stdio: 'ignore', windowsHide: true,
+  });
+  child.unref();
+
+  // 光交给脚本还不够：脚本里的 Wait-Process 得等到本进程真的退出才动文件。
+  // 这里主动退，让 Cindy 在 ~24 秒后把新文件拉起来；留 800ms 是给上面那条 RPC 回包写完 stdout。
+  // 如果哪天这条路径没退成功，脚本的 -Timeout 60 会兜底（虽然那时文件还锁着，替换会失败并在备份后报错）。
+  setTimeout(() => process.exit(0), 800);
+
+  return {
+    ...info,
+    applied: true,
+    backup,
+    scriptPath,
+    message: `已下载 ${info.latest} 并交给后台脚本替换；worker 正在退出，Cindy 大约 20~30 秒后用新版本重新拉起。`,
+  };
+}
+
+// ============================================================
 // JSON-RPC over stdio
 // ============================================================
 
@@ -1652,6 +1825,10 @@ rl.on('line', async (line) => {
       const claimed = await claimCheckin();
       await refreshUsage(true);
       result = { ...claimed, status: await buildStatus() };
+    } else if (method === 'qoder/checkUpdate') {
+      result = await checkUpdate();
+    } else if (method === 'qoder/applyUpdate') {
+      result = await applyUpdate();
     } else if (method === 'qoder/boot') {
       if (!server) await boot();
       result = await buildStatus();

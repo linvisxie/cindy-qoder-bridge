@@ -152,8 +152,9 @@ Cindy → 插件页 → 导入 `.cindy`（也可以直接把文件拖进去）�
 - **今日用量**：请求数 / tokens / 折算量（token × 倍率）
 - **模型列表**：每个模型的倍率（`· x0.2` / `· 免费`）与推理档位
 - **日志**：`bridge.log` 路径，出问题先看它
+- **检查更新**：「复制配置」右边那个按钮。点一下查 GitHub Releases，有新版会变成「安装 x.y.z」，再点一次才真装（装完进程会退出重启，所以要点两次）。装的时候先备份整个安装目录到 `<目录>.bak-<旧版本>`，再覆盖文件。
 
-AI 侧也能问：`qoder_status`、`qoder_endpoint`、`qoder_refresh`、`qoder_checkin` 四个工具。
+AI 侧也能问：`qoder_status`、`qoder_endpoint`、`qoder_refresh`、`qoder_checkin`、`qoder_update` 五个工具。`qoder_update` 传 `action=apply` 就会下载安装。
 
 ## 运行数据在哪
 

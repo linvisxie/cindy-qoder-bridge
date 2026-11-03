@@ -4,6 +4,31 @@
 
 ---
 
+## 0.1.15
+
+**2026-11-03** · 新增「检查更新」
+
+### 加了什么
+
+1. **面板按钮**。「复制配置」右边多一个「检查更新」。点一下打 GitHub Releases 查最新版；没新版就写「已是最新版本（当前）」，有新版按钮变成「安装 x.y.z」。装的时候会把 `.cindy` 下载下来解到数据目录，然后交给一个独立的 PowerShell 脚本：等当前 worker 进程退出 → 备份整个安装目录成 `<目录>.bak-<旧版本>` → 覆盖文件 → 删临时目录。Cindy 约 24 秒后用新文件重新拉起 worker。**要点两次**（先「检查」再「安装」），因为装完进程会退出重启，不该被误触。
+2. **`qoder_update` 工具**。同一个能力给 agent 用：`action=check` 只查（默认），`action=apply` 下载安装后自动重启。用户问「插件能不能更新 / 有没有新版」时会走到它。
+
+### 为什么要独立脚本
+
+Windows 上正在运行的 `.js` 是被锁住的，worker 覆盖自己一定 `EBUSY` / `EPERM`。所以 `applyUpdate()` 只负责下载 + 解包 + 生成脚本 + 用 `detached` 方式启动它，然后 `setTimeout(() => process.exit(0), 800)` 主动退出（留 800ms 把 RPC 回包写完 stdout）。脚本里的 `Wait-Process -Id <pid> -Timeout 60` 等到进程真没了才开始复制。
+
+### 顺带改的文案
+
+- 面板「在 Cindy 里接入」不再只写 OpenAI 一种协议：现在列出 Chat Completions / Responses / Anthropic Messages 三选一，并说明 Responses 保留 Base URL 末尾的 /v1、Anthropic 用同一个 Base URL 与同一个 API Key。三套协议本来就都实现了（/v1/chat/completions、/v1/responses、/v1/messages），只是面板一直没写。
+- ghost.json 的 description / whenToUse 重写：说明起的是三协议本地端点、模型元数据由插件自己公布；适用场景补上「问该选哪个协议」「问上下文窗口填多少」「问有没有新版本」。
+
+### 其它
+
+- 安装目录从 `ghost.json` 的位置反推（`join(__dirname, '..')`），不写死 Cindy 的 `owners/.../_ns/_root` 路径。
+- 仓库名可用环境变量 `QODER_BRIDGE_REPO` 覆盖，默认 `linvisxie/cindy-qoder-bridge`。
+
+---
+
 ## 0.1.14
 
 **2026-11-03** · 修代码审查（issue #9）报的 7 项

@@ -67,7 +67,9 @@
   <div class="actions">
     <button class="primary" id="refresh">刷新登录态与模型</button>
     <button id="copy">复制配置</button>
+    <button id="checkUpdate">检查更新</button>
   </div>
+  <div class="hint" id="updateMsg" hidden></div>
 </div>
 
 <div class="card">
@@ -85,9 +87,10 @@
   <h2>在 Cindy 里接入（只需一次）</h2>
   <ol class="steps">
     <li>设置 → 模型 → 添加自定义供应商</li>
-    <li>协议选 <b>OpenAI Compatible / Chat Completions</b></li>
+    <li>协议三选一，都能用：<b>OpenAI Compatible / Chat Completions</b>、<b>OpenAI Compatible / Responses</b>、<b>Anthropic / Messages</b></li>
     <li>Base URL 与 API Key 填下面两行</li>
     <li>逐个添加模型 ID，上下文窗口填 1000000，勾选视觉输入</li>
+    <li>选 Responses 就把 Base URL 末尾的 <b>/v1</b> 原样保留；选 Anthropic 用同一个 Base URL 与同一个 API Key，不需要另配</li>
   </ol>
   <div class="kv" id="baseUrl">—</div>
   <div class="kv" id="token">—</div>

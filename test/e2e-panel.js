@@ -70,6 +70,7 @@ function makeElement(id) {
   const el = {};
   const elements = ['dot', 'title', 'user', 'modelCount', 'quota', 'port', 'err',
     'baseUrl', 'token', 'mcount', 'models', 'refresh', 'copy',
+    'checkUpdate', 'updateMsg',
     'resetAt', 'expiresAt', 'ckState', 'ckNext', 'localUsage', 'checkin'];
   for (const id of elements) el[id] = makeElement(id);
 

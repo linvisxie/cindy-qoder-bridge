@@ -98,6 +98,7 @@ function makeElement(id) {
   const el = {};
   for (const id of ['dot', 'title', 'user', 'modelCount', 'quota', 'port', 'err',
     'baseUrl', 'token', 'mcount', 'models', 'refresh', 'copy',
+    'checkUpdate', 'updateMsg',
     'resetAt', 'expiresAt', 'ckState', 'ckNext', 'localUsage', 'checkin']) el[id] = makeElement(id);
 
   const fetches = [];

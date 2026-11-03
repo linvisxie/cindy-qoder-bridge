@@ -2,12 +2,12 @@
   "schemaVersion": 3,
   "id": "qoder-bridge",
   "name": "Qoder 桥",
-  "version": "0.1.14",
-  "releaseNotes": "0.1.14：修代码审查（issue #9）报的 7 项——并行工具调用分片被拆成空名字的块、缺结束信号就 EOF 被当正常说完、下游断开不取消上游、Anthropic/Responses 两路漏记输出 token、上游 4xx/5xx 被一律盖成 502、.cindy 包里没有许可与第三方声明、强制刷新读不到凭据时仍返回内存旧 token。",
+  "version": "0.1.15",
+  "releaseNotes": "0.1.15：新增「检查更新」——面板按钮 + qoder_update 工具，走 GitHub Releases 查新版，可一键下载安装；面板与描述文案写全三套协议（Chat Completions / Responses / Anthropic Messages），不再只说 OpenAI 一种。",
   "minCindyVersion": "0.1.119",
   "author": "linvis",
-  "description": "读取本机 Qoder CN 客户端的登录状态，在本机起一个 OpenAI 兼容接口，供 Cindy 的「自定义供应商」指向。不修改 Cindy 任何文件，也不会替你填供应商配置。",
-  "whenToUse": "用户想在 Cindy 里用 Qoder 的模型（Qwen/DeepSeek/GLM/Kimi/MiniMax）时；用户问 Qoder 桥的地址、状态、剩余额度时；用户说 Qoder 登录过期、要重新登录时。",
+  "description": "读取本机 Qoder CN 客户端的登录状态，在本机 127.0.0.1:47821 起一个本地端点，同时支持三套协议：OpenAI Chat Completions、OpenAI Responses、Anthropic Messages。Cindy 的「自定义供应商」选任一协议都能直接指向它，模型 ID、上下文窗口、倍率都由插件自己公布。不修改 Cindy 任何文件，也不会替你填供应商配置。",
+  "whenToUse": "用户想在 Cindy 里用 Qoder 的模型（Qwen/DeepSeek/GLM/Kimi/MiniMax）时；用户问 Qoder 桥的地址、状态、剩余额度时；用户问该选哪个协议、Responses 或 Anthropic 能不能用、上下文窗口填多少时；用户说 Qoder 登录过期、要重新登录时；用户要每日签到领额度、或问插件有没有新版本时。",
   "entry": "main.js",
   "launch": "resident",
   "command": "qoder",
@@ -50,6 +50,24 @@
       "parameters": {
         "type": "object",
         "properties": {},
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "qoder_update",
+      "description": "检查 Qoder 桥自己有没有新版本（走 GitHub Releases），也可以让它自动下载安装。用户问「插件能不能更新」「有没有新版」时调用。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "action": {
+            "type": "string",
+            "enum": [
+              "check",
+              "apply"
+            ],
+            "description": "check 只查（默认），apply 下载并安装后自动重启插件"
+          }
+        },
         "additionalProperties": false
       }
     }
