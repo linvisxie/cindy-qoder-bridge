@@ -4,6 +4,58 @@
 
 ---
 
+## 0.1.19
+
+**2026-11-04** · 修缓存命中率被算低（缓存 token 被算了两遍）
+
+### 现象
+
+「缓存拆分」那一行能看到读数（比如 `读 3.0M`），但命中率明显偏低。之前以为是上游没给数据，实际是我们映射错了。
+
+### 原因
+
+Cindy 算命中率用的是（见 `app.asar` 里的 `sI()`）：
+
+```
+命中率 = cacheRead / (input_tokens + cacheRead + cacheWrite)
+```
+
+两套协议的 `input_tokens` 语义不一样：
+
+| 协议 | 含义 |
+| --- | --- |
+| OpenAI | `prompt_tokens` = 输入**总量**，已经包含命中缓存的部分 |
+| Anthropic | `input_tokens` = 输入里**没走缓存**的净额 |
+
+旧实现把 `prompt_tokens` 直接当 `input_tokens` 发出去，同一批缓存 token 在分子和分母各算一次。
+
+### 实测证据
+
+```
+修复前：读=2355  输入=2361  → 2355/(2361+2355) = 49.94%
+修复后：读=2355  输入=6     → 2355/(6+2355)    = 99.75%  ← 真值
+```
+
+总量守恒：`6 + 2355 = 2361`，与冷启动那轮的 2361 完全一致，说明减法做对了。
+
+Cindy 自己的 OpenAI 路径也是这么减的：`input = max(0, prompt - cached - write)`。
+
+### 改了什么
+
+1. **`anthropicUsage` 扣除缓存**（P1）。`input_tokens = max(0, prompt_tokens - cached - write)`，夹 0 是为了防上游计价边界让 `cached + write` 略大于 `prompt` 时出现负数（负的 `input_tokens` 会让下游除法变 NaN）。
+2. **两个缓存字段无条件带上**（P1）。Cindy 用 `hasOwnProperty` 检查 `input_tokens` / `output_tokens` / `cache_read_input_tokens` / `cache_creation_input_tokens` 四个字段，缺一个就 `complete=false`，那一轮被当成未结算，连命中率都不显示。
+3. **账本不再把未知模型记成 `unknown`**（P2）。`recordUsage(entry, …)` 以前在 `entry` 为 undefined 时只能记 `unknown`，但真实模型名就在 `displayModel` 里。现已改为 `entry || { model: displayModel }`，与 trae 仓库对齐 —— 两个仓库同一件事行为不一致，往往就是 bug 藏身处。
+
+### 边界说明
+
+qoder 上游**只报缓存读、不报缓存写**。实测三次全新前缀的冷启动请求 `cache_creation_input_tokens` 全是 0，而紧接着重复同一前缀能拿到 `read=1154` —— 缓存确实在工作，但建立那一步上游不计「写」。所以界面上的「写 0」是数据源缺失，客户端补不出来，不是这一版能改的。
+
+### 测试
+
+`review-regressions` 新增 9 条断言（含「旧的 49.94% 必须不再出现」这条防回退）、34/34 通过。另：`host-guard 13/0`、`responses-status 19/0`、`upstream-contract 16/0`、`update-chain 51/0`、`features 42/0`、`e2e-package 25/0`、`e2e-panel 10/10`、`e2e-brain 13/13`、`verify-manifest PASS`。
+
+---
+
 ## 0.1.18
 
 **2026-11-04** · 修两处「数字变成 0」的假象，以及一条永不消失的红字

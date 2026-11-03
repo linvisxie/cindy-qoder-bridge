@@ -271,20 +271,99 @@ if (IS_TRAE) {
     assert.equal(u.total_tokens, 2045);
   });
 
-  test('anthropic usage reports cache_read_input_tokens so the hit rate is not 0', () => {
+  // ---- Anthropic usage 的 input_tokens 语义 ----
+  //
+  // OpenAI 的 prompt_tokens 是「输入总量」，**包含**命中缓存的部分；
+  // Anthropic 的 input_tokens 是「没走缓存的部分」。Cindy 算命中率用
+  //   read / (input_tokens + read + write)
+  // 如果把 prompt_tokens 直接当 input_tokens 发，缓存 token 会在分子分母各算一次。
+  // 实测 2355/2361（真实 99.75%）会被算成 49.94%——这正是「读有值、命中率却很低」的元凶。
+
+  test('anthropic input_tokens excludes the cached part (no double counting)', () => {
     const u = adapters.anthropicUsage(UPSTREAM, 0);
-    assert.equal(u.input_tokens, 2034);
+    // UPSTREAM: prompt_tokens=2034, cached_tokens=1792
+    assert.equal(u.input_tokens, 2034 - 1792);
     assert.equal(u.output_tokens, 11);
     assert.equal(u.cache_read_input_tokens, 1792);
+  });
+
+  test('anthropic hit rate computed the way Cindy does matches the real one', () => {
+    // 复现实测到的数字：prompt=2361, read=2355
+    const usage = { prompt_tokens: 2361, completion_tokens: 18, prompt_tokens_details: { cached_tokens: 2355 } };
+    const u = adapters.anthropicUsage(usage, 0);
+    const cindyRate = u.cache_read_input_tokens / (u.input_tokens + u.cache_read_input_tokens + u.cache_creation_input_tokens);
+    const realRate = 2355 / 2361;
+    assert.equal(Number(cindyRate.toFixed(4)), Number(realRate.toFixed(4)));
+    // 旧写法会得到 49.94%，钉死这个数防止回退
+    assert.notEqual(Number((cindyRate * 100).toFixed(2)), 49.94);
+  });
+
+  test('anthropic subtracts cache write as well as cache read', () => {
+    const withWrite = {
+      prompt_tokens: 2034, completion_tokens: 11,
+      prompt_tokens_details: { cached_tokens: 1792, cache_write_tokens: 240 },
+    };
+    const au = adapters.anthropicUsage(withWrite, 0);
+    assert.equal(au.input_tokens, 2034 - 1792 - 240);
+    assert.equal(au.cache_read_input_tokens, 1792);
+    assert.equal(au.cache_creation_input_tokens, 240);
+  });
+
+  test('anthropic input_tokens never goes negative', () => {
+    // 上游计价口径边界上偶尔 cached + write 会略大于 prompt
+    const odd = { prompt_tokens: 100, completion_tokens: 1, prompt_tokens_details: { cached_tokens: 80, cache_write_tokens: 40 } };
+    assert.equal(adapters.anthropicUsage(odd, 0).input_tokens, 0);
+  });
+
+  test('anthropic always emits both cache fields so Cindy sees usage as complete', () => {
+    // Cindy 用 hasOwnProperty 检查四个字段，缺一个就 complete=false，
+    // 那一轮会被当成未结算，连命中率都不显示。
+    const bare = { prompt_tokens: 100, completion_tokens: 5 };
+    const a = adapters.anthropicUsage(bare, 0);
+    for (const k of ['input_tokens', 'output_tokens', 'cache_read_input_tokens', 'cache_creation_input_tokens']) {
+      assert.ok(Object.prototype.hasOwnProperty.call(a, k), 'anthropic usage 缺字段: ' + k);
+    }
+    assert.equal(a.cache_read_input_tokens, 0);
+    assert.equal(a.cache_creation_input_tokens, 0);
+  });
+
+  test('responses keeps prompt_tokens as input_tokens (different semantics)', () => {
+    // Responses 这边 Cindy 把 input_tokens 当总量、明细另放 input_tokens_details，
+    // 所以**不能**减，减了反而少算。
+    const u = adapters.responsesUsage(UPSTREAM, 0);
+    assert.equal(u.input_tokens, 2034);
+    assert.equal(u.input_tokens_details.cached_tokens, 1792);
+    assert.equal(u.output_tokens_details.reasoning_tokens, 9);
   });
 
   test('missing cache detail falls back to 0 instead of undefined', () => {
     const bare = { prompt_tokens: 100, completion_tokens: 5 };
     assert.equal(adapters.responsesUsage(bare, 0).input_tokens_details.cached_tokens, 0);
     assert.equal(adapters.responsesUsage(bare, 0).output_tokens_details.reasoning_tokens, 0);
-    const a = adapters.anthropicUsage(bare, 0);
-    assert.equal(a.cache_read_input_tokens, undefined);  // 没有命中就不编一个 0 出来
-    assert.deepEqual(adapters.census(null), { cached: 0, reasoning: 0 });
+    assert.deepEqual(adapters.census(null), { cached: 0, written: 0, reasoning: 0 });
+  });
+
+  test('cache write tokens are carried through to both protocols', () => {
+    const withWrite = {
+      prompt_tokens: 2034, completion_tokens: 11,
+      prompt_tokens_details: { cached_tokens: 1792, cache_write_tokens: 240 },
+      completion_tokens_details: { reasoning_tokens: 9 },
+    };
+    const ru = adapters.responsesUsage(withWrite, 0);
+    assert.equal(ru.input_tokens_details.cached_tokens, 1792);
+    assert.equal(ru.input_tokens_details.cache_write_tokens, 240);
+    const au = adapters.anthropicUsage(withWrite, 0);
+    assert.equal(au.cache_read_input_tokens, 1792);
+    assert.equal(au.cache_creation_input_tokens, 240);
+  });
+
+  test('cache_creation_tokens is accepted as an alias', () => {
+    const alias = { prompt_tokens: 10, completion_tokens: 1, prompt_tokens_details: { cache_creation_tokens: 80 } };
+    assert.equal(adapters.census(alias).written, 80);
+    const noWrite = { prompt_tokens: 10, completion_tokens: 1, prompt_tokens_details: { cached_tokens: 5 } };
+    assert.equal(adapters.census(noWrite).written, 0);
+    // responses 侧没写就不编一个字段出来
+    assert.equal(adapters.responsesUsage(noWrite, 0).input_tokens_details.cache_write_tokens, undefined);
   });
 
   test('a real zero cache hit stays zero and is not treated as missing', () => {
@@ -294,6 +373,7 @@ if (IS_TRAE) {
       completion_tokens_details: { reasoning_tokens: 0 },
     };
     assert.equal(adapters.responsesUsage(noHit, 0).input_tokens_details.cached_tokens, 0);
-    assert.equal(adapters.anthropicUsage(noHit, 0).cache_read_input_tokens, undefined);
+    assert.equal(adapters.anthropicUsage(noHit, 0).cache_read_input_tokens, 0);
   });
+
 }

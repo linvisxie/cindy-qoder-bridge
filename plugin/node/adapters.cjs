@@ -464,9 +464,16 @@ function responsesStatusOf(finish) {
 // 是我们把真值丢了。现在原样透传，只在上游真没给时才落 0。
 function census(usage) {
   const cached = usage?.prompt_tokens_details?.cached_tokens;
+  // 「写」这一侧上游可能有好几种叫法，能认的都认一遍：
+  //   trae 上游（解密后的 token_usage）→ cache_write_tokens
+  //   通用 OpenAI 扩展 → cache_creation_tokens / cache_write_tokens
+  // qoder 上游实测不给这一项，那就是真没有，不是我们丢了。
+  const written = usage?.prompt_tokens_details?.cache_write_tokens
+    ?? usage?.prompt_tokens_details?.cache_creation_tokens;
   const reasoning = usage?.completion_tokens_details?.reasoning_tokens;
   return {
     cached: Number.isFinite(cached) ? cached : 0,
+    written: Number.isFinite(written) ? written : 0,
     reasoning: Number.isFinite(reasoning) ? reasoning : 0,
   };
 }
@@ -474,13 +481,30 @@ function census(usage) {
 // Anthropic 的缓存命中走 cache_read_input_tokens，语义与 OpenAI 的
 // cached_tokens 一致（都表示「输入里命中缓存的那部分」）。Cindy 靠它算命中率，
 // 不填的话界面会一律显示 0%，看着像缓存坏了。
+//
+// **input_tokens 必须把缓存部分减掉**。两套语义不一样：
+//   OpenAI     prompt_tokens = 输入总量，**包含**命中缓存与新写入缓存的部分
+//   Anthropic  input_tokens  = 输入里**没走缓存**的部分
+//               总计 = input_tokens + cache_read_input_tokens + cache_creation_input_tokens
+//
+// Cindy 算命中率用的是 read / (in + read + write)（见 app.asar 里的 sI()）。
+// 如果把 prompt_tokens 直接当 input_tokens 发，同一批缓存 token 会在分子和分母
+// 各算一次，命中率被撑模糊：实测 2355/2361（真实 99.75%）会被算成 49.94%。
+// Cindy 自己的 OpenAI 路径就是这么减的：input = max(0, prompt - cached - write)。
 function anthropicUsage(usage, inputTokens) {
-  const inp = usage?.prompt_tokens ?? inputTokens ?? 0;
+  const total = usage?.prompt_tokens ?? inputTokens ?? 0;
   const out = (usage && usage.completion_tokens) || 0;
   const det = census(usage);
+  // 减完夹到 0：上游偶尔会让 cached + write 略大于 prompt（计价口径边界），
+  // 负的 input_tokens 会让下游除法变成 NaN。
+  const inp = Math.max(0, total - det.cached - det.written);
   return {
     input_tokens: inp,
-    ...(det.cached ? { cache_read_input_tokens: det.cached } : {}),
+    // 两个缓存字段无条件带上。Cindy 判定一条 usage 是否「完整」靠的是
+    // 四个字段都存在（hasOwnProperty），缺一个就 complete=false，
+    // 那一轮会被当成未结算，连命中率都不显示。
+    cache_read_input_tokens: det.cached,
+    cache_creation_input_tokens: det.written,
     output_tokens: out,
   };
 }
@@ -491,7 +515,10 @@ function responsesUsage(usage, inputTokens) {
   const det = census(usage);
   return {
     input_tokens: inp,
-    input_tokens_details: { cached_tokens: det.cached },
+    input_tokens_details: {
+      cached_tokens: det.cached,
+      ...(det.written ? { cache_write_tokens: det.written } : {}),
+    },
     output_tokens: out,
     output_tokens_details: { reasoning_tokens: det.reasoning },
     total_tokens: inp + out,

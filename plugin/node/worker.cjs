@@ -1308,7 +1308,7 @@ async function chatCompletions(req, res) {
     const message = { role: 'assistant', content: content.join('') };
     if (calls.size) message.tool_calls = [...calls.values()];
     cancelOnClose.done();
-    recordUsage(entry, 'chat', usage?.prompt_tokens, usage?.completion_tokens);
+    recordUsage(entry || { model: displayModel }, 'chat', usage?.prompt_tokens, usage?.completion_tokens);
     sendJson(res, 200, {
       id: `chatcmpl-${crypto.randomBytes(8).toString('hex')}`,
       object: 'chat.completion', created: Math.floor(Date.now() / 1e3),
@@ -1352,13 +1352,13 @@ async function chatCompletions(req, res) {
     res.write('data: [DONE]\n\n');
     res.end();
     cancelOnClose.done();
-    recordUsage(entry, 'chat', streamUsage?.prompt_tokens, streamUsage?.completion_tokens);
+    recordUsage(entry || { model: displayModel }, 'chat', streamUsage?.prompt_tokens, streamUsage?.completion_tokens);
     return;
   }
   res.write('data: [DONE]\n\n');
   res.end();
   cancelOnClose.done();
-  recordUsage(entry, 'chat', streamUsage?.prompt_tokens, streamUsage?.completion_tokens);
+  recordUsage(entry || { model: displayModel }, 'chat', streamUsage?.prompt_tokens, streamUsage?.completion_tokens);
 }
 
 // 两种新协议共用的上游开启逻辑：凭证、重试排队、错误落盘。
@@ -1442,7 +1442,7 @@ async function anthropicMessages(req, res) {
   } finally {
     up.cancelOnClose.done();
     const out = opts.usage && typeof opts.usage.completion_tokens === 'number' ? opts.usage.completion_tokens : 0;
-    recordUsage(entry, 'anthropic', opts.usage?.prompt_tokens ?? opts.inputTokens, out);
+    recordUsage(entry || { model: displayModel }, 'anthropic', opts.usage?.prompt_tokens ?? opts.inputTokens, out);
   }
 }
 
@@ -1492,7 +1492,7 @@ async function openaiResponses(req, res) {
   } finally {
     up.cancelOnClose.done();
     const out = opts.usage && typeof opts.usage.completion_tokens === 'number' ? opts.usage.completion_tokens : 0;
-    recordUsage(entry, 'responses', opts.usage?.prompt_tokens ?? opts.inputTokens, out);
+    recordUsage(entry || { model: displayModel }, 'responses', opts.usage?.prompt_tokens ?? opts.inputTokens, out);
   }
 }
 
