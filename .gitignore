@@ -21,6 +21,9 @@ _peek.cjs
 .credentials.json
 .qoder-catalog*.json
 
+# CI 运行产物（测试日志、JUnit、校验报告）：只该出现在 Actions 里
+artifacts/
+
 # 编辑器 / 系统
 node_modules/
 package-lock.json

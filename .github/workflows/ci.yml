@@ -1,0 +1,244 @@
+name: CI
+
+# 日常提交的自动检查：语法、清单、离线测试、打包、安全扫描。
+# 日常提交永远不发布 Release —— 发布见 release.yml，必须由维护者手动发起。
+
+on:
+  push:
+    branches: [main, 'fix/**', 'feat/**', 'ci/**']
+    paths-ignore:
+      - '**.md'
+      - 'assets/**'
+      - 'dist/**'
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: '跑哪一组测试'
+        required: true
+        default: offline
+        type: choice
+        options: [offline, live]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  NODE_VERSION: '22'
+
+jobs:
+  static:
+    name: 静态检查
+    runs-on: windows-latest
+    timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      package: ${{ steps.pkg.outputs.name }}
+    steps:
+      - name: 检出
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 安装 Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: 报告运行环境
+        shell: pwsh
+        run: |
+          node --version
+          Write-Host "runner=$env:RUNNER_OS arch=$env:RUNNER_ARCH"
+
+      - name: JS 语法检查
+        shell: pwsh
+        run: |
+          $failed = @()
+          Get-ChildItem -Recurse -File -Include *.js,*.cjs -Path plugin,test,'.github/scripts' |
+            ForEach-Object {
+              node --check $_.FullName
+              if ($LASTEXITCODE -ne 0) { $failed += $_.FullName }
+            }
+          if ($failed.Count -gt 0) {
+            Write-Host '::error::以下文件有语法错误'
+            $failed | ForEach-Object { Write-Host $_ }
+            exit 1
+          }
+          Write-Host '语法检查通过'
+
+      - name: 插件清单校验
+        shell: pwsh
+        run: node plugin/scripts/verify-manifest.cjs
+
+      - name: 版本号一致性（ghost.json / package.json / CHANGELOG）
+        shell: pwsh
+        run: node .github/scripts/check-version.cjs
+
+      - name: 测试分类完整性 + 规划矩阵
+        id: plan
+        shell: pwsh
+        run: |
+          $out = node .github/scripts/ci-run.cjs --mode offline --list
+          if ($LASTEXITCODE -ne 0) { Write-Host '::error::测试分类不完整'; exit 1 }
+          $line = ($out | Select-Object -Last 1)
+          if (-not $line.StartsWith('matrix=')) { Write-Host "::error::拿不到测试矩阵：$line"; exit 1 }
+          $json = $line.Substring(7)
+          "matrix=$json" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Write-Host "matrix=$json"
+
+      - name: 读取产物名
+        id: pkg
+        shell: pwsh
+        run: |
+          $name = node .github/scripts/package-name.cjs
+          "name=$name" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Write-Host "产物名：$name"
+
+  # 工作流自身也要检查：YAML / 表达式写错，应该在提交时红，而不是半夜发版时才发现。
+  workflow-lint:
+    name: 工作流语法检查
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: 检出
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: actionlint
+        uses: raven-actions/actionlint@3d39aea434753780c3b3d4a1a31c854b4dbf49d7 # v2.2.0
+
+  # JavaScript 静态分析。公开仓库免费，不产生费用。
+  # fork 的 PR 不跑（它拿不到 security-events 写权限，跑了也白跑）。
+  codeql:
+    name: 代码安全扫描
+    runs-on: windows-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      security-events: write
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    steps:
+      - name: 检出
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 初始化 CodeQL
+        uses: github/codeql-action/init@1fc58d04a4d4374f921bdac573c3811c240f9c26 # v4.39.2
+        with:
+          languages: javascript-typescript
+          queries: security-and-quality
+
+      - name: 分析并上传结果
+        uses: github/codeql-action/analyze@1fc58d04a4d4374f921bdac573c3811c240f9c26 # v4.39.2
+        with:
+          category: '/language:javascript-typescript'
+
+  offline-tests:
+    name: 离线测试 / ${{ matrix.script }}
+    needs: static
+    runs-on: windows-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.static.outputs.matrix) }}
+    steps:
+      - name: 检出
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 安装 Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: 运行 ${{ matrix.script }}
+        shell: pwsh
+        run: node .github/scripts/ci-run.cjs --mode offline --only ${{ matrix.script }}
+
+      - name: 收集日志与报告
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ci-logs-${{ matrix.script }}
+          path: |
+            artifacts/ci-logs/
+            artifacts/junit-offline.xml
+            artifacts/summary-offline.md
+          if-no-files-found: warn
+          retention-days: 5
+
+  # 打包 + 产物校验：只有静态检查与离线测试全过才进来。
+  build:
+    name: 构建产物
+    needs: [static, offline-tests]
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - name: 检出
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 安装 Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: 打包
+        shell: pwsh
+        run: node plugin/scripts/pack.cjs
+
+      - name: 校验产物（内容 / 源码一致性 / 无凭证 / 可启动）
+        shell: pwsh
+        run: node .github/scripts/verify-package.cjs --package "dist/${{ needs.static.outputs.package }}"
+
+      - name: 记录构建信息
+        shell: pwsh
+        env:
+          PKG: ${{ needs.static.outputs.package }}
+        run: |
+          $path = "dist/$env:PKG"
+          $hash = (Get-FileHash $path -Algorithm SHA256).Hash.ToLower()
+          $size = (Get-Item $path).Length
+          Write-Host "产物：$env:PKG  $size 字节  sha256=$hash"
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Value @(
+            '### 构建产物'
+            ''
+            "- 文件：$env:PKG"
+            "- 大小：$size 字节"
+            "- sha256：$hash"
+            "- 提交：${{ github.sha }}"
+          )
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: built-package
+          path: |
+            dist/*.cindy
+            artifacts/SHA256SUMS.txt
+            artifacts/package-verification.json
+          if-no-files-found: error
+          retention-days: 14
+
+  # live 组需要真实登录态，托管 Runner 上跑不了。
+  # 这里显式失败，免得有人以为「手动点了 live 没报错」= 通过了。
+  live-not-supported:
+    name: live 组（托管 Runner 不支持）
+    if: github.event_name == 'workflow_dispatch' && inputs.mode == 'live'
+    runs-on: ubuntu-latest
+    steps:
+      - name: 说明
+        run: |
+          echo '::error::live 组需要本机已登录上游客户端（Qoder / Trae CN）与真实上游，托管 Runner 上无法运行'
+          echo '请在开发机上运行：node .github/scripts/ci-run.cjs --mode live'
+          exit 1
