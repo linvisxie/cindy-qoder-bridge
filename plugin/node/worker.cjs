@@ -558,6 +558,23 @@ function normalizeBucket(src) {
   };
 }
 
+// Empty/error payloads are not evidence that the account has no quota.
+function validUsageResponse(response) {
+  if (!response.ok || !response.json || response.json.success === false || response.json.error) return false;
+  const root = response.json.qoderUsage ?? response.json.data ?? response.json;
+  if (!root || typeof root !== 'object' || Array.isArray(root)) return false;
+  if (root.success === false || root.error) return false;
+  const key = ['userQuota', 'user_quota'].find(k => Object.hasOwn(root, k));
+  if (!key) return false;
+  const bucket = root[key];
+  // Explicit null represents no quota; absent/unknown fields do not.
+  if (bucket === null) return true;
+  if (!bucket || typeof bucket !== 'object' || Array.isArray(bucket)) return false;
+  const total = bucket.total ?? bucket.totalAmount ?? bucket.quota ?? bucket.amount;
+  return (typeof total === 'number' || (typeof total === 'string' && total.trim() !== ''))
+    && Number.isFinite(Number(total)) && Number(total) >= 0;
+}
+
 // 用量面板：先走 /sash/api/v2/me/usage（给会员到期日、附加包、展示模式），
 // 失败再退回 /api/v2/quota/usage（老接口，只有一份 userQuota）。
 async function refreshUsage(force) {
@@ -566,12 +583,12 @@ async function refreshUsage(force) {
   let payload;
   let source = '';
   const presentation = await openApiGet('/sash/api/v2/me/usage');
-  if (presentation.ok && presentation.json) {
+  if (validUsageResponse(presentation)) {
     payload = presentation.json.qoderUsage ?? presentation.json.data ?? presentation.json;
     source = 'me/usage';
   } else {
     const legacy = await openApiGet('/api/v2/quota/usage');
-    if (legacy.ok && legacy.json) {
+    if (validUsageResponse(legacy)) {
       payload = legacy.json.qoderUsage ?? legacy.json.data ?? legacy.json;
       source = 'quota/usage';
     } else {
