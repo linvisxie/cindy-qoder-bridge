@@ -4,6 +4,31 @@
 
 ---
 
+## 0.1.17
+
+**2026-11-03** · 修输入用量记账与自更新的两个假象（issue #10）
+
+### 修了什么
+
+1. **输入用量记的是估算值，不是上游真实值**（P2）。`/v1/messages` 与 `/v1/responses` 的 `opts.inputTokens` 来自 `adapters.estimateTokens(chat.messages)`，是本地按字符估的；上游在 `usage.prompt_tokens` 里给了真值也不看。所以上游说输入 123，账本照样记 1。现在优先用 `opts.usage.prompt_tokens`，拿不到才退回估算，且用 `??` 而非 `||` —— **真实的 0 不会被当成「没有值」再估一遍**。Anthropic 侧的 `input_tokens` 同步修正：流式在 `message_delta` 里补上 `input_tokens`（原来只报了 `output_tokens`），非流式的响应体也不再报本地估算。
+
+2. **自更新只看摘要，不校验包的身份**（P2）。上一轮加了 sha256 校验，但摘要只能证明「下载的字节和发布记录一致」，证明不了「这个包是 Qoder 桥、版本对、入口齐全」。一个 SHA 正确但里面装着别的插件 `ghost.json`、没有 `main.js` 的 ZIP 照样会进安装流程。现在 `validatePackage()` 在解包**之前**先读中央目录逐条校验：条目路径合法且不重复（挡 `../` 与重复项）、有 `ghost.json` 且是合法 JSON、`id` 必须等于 `qoder-bridge`、`schemaVersion` 必须为 3、版本必须等于目标发布且**严格高于当前版本**（挡降级和原地重装）、`entry` / `node.entry` / `panel.html` 与 `main.js` / `panel.js` / `panel.html` / `node/worker.cjs` 以及 `node/adapters.cjs`、`node/update.cjs` 必须都在包里。
+
+3. **解包目录可能被旧残留补齐**（P2）。暂存目录原来是 `stage-<版本>`，同名目录里上次失败留下的文件会混进来，让本该缺失的入口「看起来存在」。现在用 `mkdtempSync` 建唯一目录，`.ps1` / `.cjs` / `.cindy` 也各自带唯一名，顺带隔离并发更新。
+
+4. **安装器根本没启动，却报告 applied 并退出**（P2）。`spawn()` 返回子进程时，`ENOENT`（`powershell.exe` 找不到）和 `EACCES` 是通过**异步 `error` 事件**发出的，原实现没等这个事件，于是先 `return applied: true`、再 `setTimeout(process.exit, 800)` —— 结果就是脚本没跑、worker 却退干净了，插件直接挂掉等人手动重启。现在用 `waitForSpawn()` 等 `spawn` 或 `error`：启动失败就删掉本次的暂存目录与三个临时文件，**抛错且不安排退出**，当前 worker 继续服务。提示语也从「已交给后台脚本」改成「已成功启动后台安装脚本」，不再承诺未发生的事。
+
+### 加了什么
+
+- **`test/review-regressions.js`**，19 项离线行为回归：用 `vm` 加载真实 `worker.cjs`、假上游、假安装器，不联网、不用真实凭据、不执行覆盖安装。覆盖真实输入 123 与 0（流式/非流式 × Anthropic/Responses）、错误插件包、缺 `main.js`、非法入口、`ENOENT`/`EACCES`、以及「启动成功才安排退出」。
+- `updater` 导出 `validatePackage` 与 `waitForSpawn`。
+
+### 测试
+
+`review-regressions 19/19`（新）、`update-chain 51/0`、`host-guard 13/0`、`responses-status 19/0`、`upstream-contract 16/0（1 跳过）`、`features 42/0`、`e2e-package 25/0`、`e2e-panel 10/10`、`e2e-brain 13/13`、`verify-manifest PASS`。
+
+**边界**：Windows 真机覆盖升级、Cindy 桌面导入、真实账号换票与真实上游对话未在本机独立验证；`spawn` 成功也不等于后续安装一定完成。
+
 ## 0.1.16
 
 **2026-11-03** · 把自更新链路补成可靠的，并加英文 README
