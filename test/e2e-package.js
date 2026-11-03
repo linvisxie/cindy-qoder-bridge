@@ -35,6 +35,12 @@ for (const rel of MUST) {
   if (existsSync(join(work, rel))) ok(`包含 ${rel}`);
   else bad(`缺少 ${rel}`);
 }
+// MIT 要求分发时随附许可与版权声明，跑到别人机器上的 .cindy 才是真正的「分发」
+for (const rel of ['LICENSE', 'NOTICE', 'THIRD-PARTY-NOTICES.md']) {
+  if (existsSync(join(work, rel))) ok(`包内带 ${rel}`);
+  else bad(`包内缺少 ${rel}（MIT 要求随附许可与版权声明）`);
+}
+
 if (!existsSync(join(work, 'ghost.json'))) process.exit(1);
 
 let manifest;

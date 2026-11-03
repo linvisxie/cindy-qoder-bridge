@@ -398,7 +398,15 @@ function saveState(patch) {
 async function refreshCredential(force) {
   if (!force && credential && Date.now() - credentialAt < 5 * 60 * 1000) return credential;
   const c = await loadCredential(region);
-  if (c) { credential = c; credentialAt = Date.now(); }
+  if (c) {
+    credential = c;
+    credentialAt = Date.now();
+  } else if (force) {
+    // 强制刷新就是要「重新读一次登录态」：读不到说明 Qoder 那边已经登出/掉线了，
+    // 这时候继续拿内存里的旧 token 去求上游，只会一路 401 让人以为插件坏了。
+    credential = undefined;
+    credentialAt = 0;
+  }
   return credential;
 }
 
@@ -894,6 +902,9 @@ async function* streamChat(cred, req, signal) {
   const dec = new TextDecoder();
   let buf = '';
   let done = false;
+  // 上游会在结束时给 [DONE] 或带 finish_reason 的帧。两个都没等到就 EOF，
+  // 说明这条流是被掐断的，半截回答不能当完整结果交出去。
+  let sawEnd = false;
   try {
     while (!done) {
       const step = await reader.read();
@@ -906,12 +917,13 @@ async function* streamChat(cred, req, signal) {
         if (!line.startsWith('data:')) continue;
         const p = line.slice(5).trim();
         if (!p) continue;
-        if (p === '[DONE]') { done = true; break; }
+        if (p === '[DONE]') { done = true; sawEnd = true; break; }
         let env;
         try { env = JSON.parse(p); } catch { continue; }
         let chunk = env;
         if (typeof env?.body === 'string') { try { chunk = JSON.parse(env.body); } catch { continue; } }
         else if (env?.body !== undefined && typeof env.body === 'object') chunk = env.body;
+        if (Array.isArray(chunk?.choices) && chunk.choices.some((c) => c && typeof c.finish_reason === 'string')) sawEnd = true;
         if (chunk?.choices !== undefined || (chunk?.usage !== undefined && chunk.usage !== null)) { yield chunk; continue; }
         if (chunk?.code != null || chunk?.errorCode != null || typeof chunk?.message === 'string') {
           const code = String(chunk.code ?? chunk.errorCode ?? '');
@@ -924,6 +936,12 @@ async function* streamChat(cred, req, signal) {
         }
       }
       if (step.done) break;
+    }
+    if (!sawEnd) {
+      const e = new Error('上游在结束信号到达前就断开了连接，这次回答不完整');
+      e.status = 502;
+      e.upstreamCode = 'upstream_truncated';
+      throw e;
     }
   } finally { try { await reader.cancel(); } catch {} }
 }
@@ -947,6 +965,9 @@ function humanizeUpstreamError(err) {
 
   const pick = (msg, extra) => ({ message: msg, detail, ...(extra || {}) });
 
+  if (code === 'upstream_truncated') {
+    return pick('Qoder 在说完之前就断流了，这次回答不完整。直接重发一次通常就好。', { type: 'upstream_error' });
+  }
   if (code === '105' || /TOKEN_EXPIRE|TOKEN_INVALID|token expired|unauthoriz/i.test(raw)) {
     return pick('Qoder 登录失效了：请打开 Qoder CN 客户端重新登录，然后回来点面板上的「刷新」。', { type: 'auth_expired' });
   }
@@ -966,6 +987,50 @@ function humanizeUpstreamError(err) {
     return pick(`Qoder 服务器出错了（${code}），过一会儿再试。`, { type: 'upstream_error' });
   }
   return pick(`Qoder 返回错误：${raw.slice(0, 200)}`, { type: 'upstream_error' });
+}
+
+// 下游挂断要能中断上游。只管 req 的 'close' 是不够的：Node 里 req 是请求流，
+// 客户端断开时它常已读完并 end，'close' 早发过了；真正可靠的是 res 的 'close'。
+// 同时正常结束时必须把监听摘掉，否则连接复用时会被上一次的监听误伤。
+function bindAbort(req, res, controller) {
+  const onClose = () => {
+    if (!res.writableEnded) controller.abort();
+  };
+  req.on('close', onClose);
+  res.on('close', onClose);
+  let done = false;
+  return {
+    done() {
+      if (done) return;
+      done = true;
+      req.removeListener('close', onClose);
+      res.removeListener('close', onClose);
+    },
+  };
+}
+
+// 上游已经把错误分好类了，别再用一个 502 把它抹平：
+// 401/403 该让客户端重新登录，402 该提示付费/额度，429 该退避重试。
+// 只有确实无从判断的才退回 502，排队没等到位置的仍是 503。
+function errorStatusOf(e) {
+  const queued = queueWaitMs(e);
+  if (queued !== undefined) return 503;
+  const s = Number(e?.status);
+  if (Number.isInteger(s) && s >= 400 && s <= 599) return s;
+  return 502;
+}
+
+function errorBodyOf(e) {
+  const queued = queueWaitMs(e);
+  const nice = humanizeUpstreamError(e);
+  return {
+    error: {
+      message: nice.message,
+      type: nice.type ?? (queued === undefined ? 'upstream_error' : 'rate_limit'),
+      detail: nice.detail,
+      ...(queued === undefined ? {} : { retry_after_seconds: Math.ceil(queued / 1000) }),
+    },
+  };
 }
 
 // ---------- 本地 HTTP ----------
@@ -1172,7 +1237,7 @@ async function chatCompletions(req, res) {
 
   const wantStream = payload.stream !== false;
   const controller = new AbortController();
-  req.on('close', () => controller.abort());
+  const cancelOnClose = bindAbort(req, res, controller);
 
   let iterator, first;
   try {
@@ -1191,17 +1256,9 @@ async function chatCompletions(req, res) {
       }
     }
   } catch (e) {
+    cancelOnClose.done();
     log('对话失败', displayModel, e.message.slice(0, 200));
-    const queued = queueWaitMs(e);
-    const nice = humanizeUpstreamError(e);
-    sendJson(res, queued === undefined ? 502 : 503, {
-      error: {
-        message: nice.message,
-        type: nice.type ?? (queued === undefined ? 'upstream_error' : 'rate_limit'),
-        detail: nice.detail,
-        ...(queued === undefined ? {} : { retry_after_seconds: Math.ceil(queued / 1000) }),
-      },
-    });
+    sendJson(res, errorStatusOf(e), errorBodyOf(e));
     return;
   }
 
@@ -1226,6 +1283,7 @@ async function chatCompletions(req, res) {
     }
     const message = { role: 'assistant', content: content.join('') };
     if (calls.size) message.tool_calls = [...calls.values()];
+    cancelOnClose.done();
     recordUsage(entry, 'chat', usage?.prompt_tokens, usage?.completion_tokens);
     sendJson(res, 200, {
       id: `chatcmpl-${crypto.randomBytes(8).toString('hex')}`,
@@ -1269,22 +1327,24 @@ async function chatCompletions(req, res) {
     res.write(`data: ${JSON.stringify({ error: { message: nice.message, type: nice.type ?? 'upstream_error', detail: nice.detail } })}\n\n`);
     res.write('data: [DONE]\n\n');
     res.end();
+    cancelOnClose.done();
     recordUsage(entry, 'chat', streamUsage?.prompt_tokens, streamUsage?.completion_tokens);
     return;
   }
   res.write('data: [DONE]\n\n');
   res.end();
+  cancelOnClose.done();
   recordUsage(entry, 'chat', streamUsage?.prompt_tokens, streamUsage?.completion_tokens);
 }
 
 // 两种新协议共用的上游开启逻辑：凭证、重试排队、错误落盘。
-// 返回 {ok:true, iterator, first} 或 {ok:false}（已经回过错误响应）。
+// 返回 {ok:true, iterator, first, cancelOnClose} 或 {ok:false}（已经回过错误响应）。
 async function openUpstream(req, res, request, displayModel) {
   const cred = await refreshCredential(false);
   if (!cred) { sendJson(res, 401, { error: { message: 'Qoder 未登录或凭证无法解密' } }); return { ok: false }; }
 
   const controller = new AbortController();
-  req.on('close', () => controller.abort());
+  const cancelOnClose = bindAbort(req, res, controller);
 
   let iterator, first;
   try {
@@ -1303,20 +1363,12 @@ async function openUpstream(req, res, request, displayModel) {
       }
     }
   } catch (e) {
+    cancelOnClose.done();
     log('对话失败', displayModel, e.message.slice(0, 200));
-    const queued = queueWaitMs(e);
-    const nice = humanizeUpstreamError(e);
-    sendJson(res, queued === undefined ? 502 : 503, {
-      error: {
-        message: nice.message,
-        type: nice.type ?? (queued === undefined ? 'upstream_error' : 'rate_limit'),
-        detail: nice.detail,
-        ...(queued === undefined ? {} : { retry_after_seconds: Math.ceil(queued / 1000) }),
-      },
-    });
+    sendJson(res, errorStatusOf(e), errorBodyOf(e));
     return { ok: false };
   }
-  return { ok: true, iterator, first };
+  return { ok: true, iterator, first, cancelOnClose };
 }
 
 async function anthropicMessages(req, res) {
@@ -1359,10 +1411,15 @@ async function anthropicMessages(req, res) {
   if (!up.ok) return;
 
   const opts = { model: displayModel, inputTokens: adapters.estimateTokens(chat.messages) };
-  if (chat.stream) await adapters.writeAnthropicStream(res, up.first, up.iterator, opts);
-  else sendJson(res, 200, await adapters.anthropicMessage(up.first, up.iterator, opts));
-  // 适配层不回传上游 usage，本地账本按估算输入 + 0 输出记一笔，至少能看请求次数与量级
-  recordUsage(entry, 'anthropic', opts.inputTokens, 0);
+  // 上游给了真实 usage 就用真实值记账；适配层会把它写在 opts.usage 上回传。
+  try {
+    if (chat.stream) await adapters.writeAnthropicStream(res, up.first, up.iterator, opts);
+    else sendJson(res, 200, await adapters.anthropicMessage(up.first, up.iterator, opts));
+  } finally {
+    up.cancelOnClose.done();
+    const out = opts.usage && typeof opts.usage.completion_tokens === 'number' ? opts.usage.completion_tokens : 0;
+    recordUsage(entry, 'anthropic', opts.inputTokens, out);
+  }
 }
 
 async function openaiResponses(req, res) {
@@ -1404,9 +1461,15 @@ async function openaiResponses(req, res) {
   if (!up.ok) return;
 
   const opts = { model: displayModel, inputTokens: adapters.estimateTokens(chat.messages) };
-  if (chat.stream) await adapters.writeResponsesStream(res, up.first, up.iterator, opts);
-  else sendJson(res, 200, await adapters.responsesMessage(up.first, up.iterator, opts));
-  recordUsage(entry, 'responses', opts.inputTokens, 0);
+  // 上游给了真实 usage 就用真实值记账；适配层会把它写在 opts.usage 上回传。
+  try {
+    if (chat.stream) await adapters.writeResponsesStream(res, up.first, up.iterator, opts);
+    else sendJson(res, 200, await adapters.responsesMessage(up.first, up.iterator, opts));
+  } finally {
+    up.cancelOnClose.done();
+    const out = opts.usage && typeof opts.usage.completion_tokens === 'number' ? opts.usage.completion_tokens : 0;
+    recordUsage(entry, 'responses', opts.inputTokens, out);
+  }
 }
 
 function listenOn(port) {

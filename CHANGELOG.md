@@ -4,6 +4,27 @@
 
 ---
 
+## 0.1.14
+
+**2026-11-03** · 修代码审查（issue #9）报的 7 项
+
+### 修了什么
+
+1. **并行工具调用被拆坏**（P1）。上游把两次工具调用的分片交错着发：首帧 A/B 各带 id 和半截参数，次帧只带参数增量、`name` 是空串。旧实现的 `writeAnthropicStream` 见到新 index 就 `closeOpen()` 把已开的块全关掉，结果是 4 个 `tool_use` 块、后两个名字是空。现在按上游 index 独立累计 id/name/arguments，整轮读完再逐个吐完整块；文本仍照常流式。
+2. **缺结束信号就 EOF 被当成正常说完**（P1）。上游会在结束时给 `[DONE]` 或带 `finish_reason` 的帧，两个都没等到就断流，说明这条流是被掐断的。旧实现照常收尾，半截回答会被当完整结果交给 Cindy。现在四个出口（Anthropic 流/非流、Responses 流/非流）以及 Qoder 私有流都要求见到明确结束信号，否则抛「上游在结束信号到达前就断开了连接」。
+3. **下游断开不取消上游**（P2）。原先只听 `req` 的 `close`，但客户端断开时请求流往往已经 end 过、事件早发完了。现在同时听 `res` 的 `close`，且只在 `!res.writableEnded` 时 abort；正常结束时摘掉监听。
+4. **Anthropic / Responses 两路本地账本漏记输出 token**（P2）。之前无论上游给不给 usage，这两路都固定记 `输出 = 0`。现在适配器把真实 usage 回传，worker 优先记真实值，缺失才当 0。
+5. **上游明确的 4xx/5xx 被一律盖成 502**（P2）。`errorStatusOf()` 先看能不能排队重试（→503），再看 `err.status` 是不是合法 4xx/5xx（照原样透出），实在分不清才 502。
+6. **.cindy 包里没有许可与第三方声明**（P2）。MIT 要求分发时随附许可与版权声明，而装到别人机器上的包才算真分发。`pack.cjs` 的清单改成 `{from, name}` 结构，从仓库根一并打进 `LICENSE` / `NOTICE` / `THIRD-PARTY-NOTICES.md`。
+7. **强制刷新读不到凭据时仍返回内存里的旧 token**（P2）。面板上点「刷新」本意是「重新读一次登录态」，但 `refreshCredential(true)` 只在读到新凭据时覆盖，读不到就继续拿旧 token 去求上游，一路 401 让人以为插件坏了。现在 force 且读不到时清空 `credential` / `credentialAt`，面板会直接显示未登录。
+
+### 另外
+
+- 新增 `test/upstream-contract.js`：把上面第 1、2、4 项做成纯离线回归（交错分片、四种出口的截断判定、usage 回传），不需要登录态和额度。
+- `test/e2e-package.js` 增加三条断言：包里必须含 `LICENSE`、`NOTICE`、`THIRD-PARTY-NOTICES.md`。
+
+---
+
 ## 0.1.13
 
 修「模型选择器被撑开，整排控件被推离麦克风」。

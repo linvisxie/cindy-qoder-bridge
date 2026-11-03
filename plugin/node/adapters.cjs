@@ -163,6 +163,30 @@ function anthropicRequestToChat(body) {
 
 // ---------- 下行：chat chunk → Anthropic SSE ----------
 
+// 上游在给出结束信号（finish_reason / done）之前就断开时，以前会被当成「正常说完」，
+// 于是半截文本、半截工具参数被原样交给客户端，读代码的会以为文件就这么长、
+// 调工具的会拿半个 JSON 去执行。这里把它变成一个显式的截断错误。
+function truncatedUpstreamError() {
+  const err = new Error('上游在结束信号到达前就断开了连接，这次回答不完整');
+  err.status = 502;
+  err.code = 'upstream_truncated';
+  err.upstreamCode = 'upstream_truncated';
+  return err;
+}
+
+// 工具调用的分片要按上游 index 独立攒着，等整轮读完再逐块吐出完整块。
+// 以前「遇到新 index 就 closeOpen()」会把已经开了的工具块全关掉：
+// A/B 交错分片时同一个 index 会重复开块，最后吐出 4 个 tool_use、后两个 name 是空的。
+function collectToolCall(store, t) {
+  const key = t.index ?? 0;
+  const cur = store.get(key) || { id: '', name: '', args: '' };
+  if (t.id) cur.id = String(t.id);
+  if (t.function && typeof t.function.name === 'string' && t.function.name) cur.name = t.function.name;
+  if (t.function && typeof t.function.arguments === 'string') cur.args += t.function.arguments;
+  store.set(key, cur);
+  return cur;
+}
+
 async function writeAnthropicStream(res, first, iterator, opts) {
   const id = 'msg_' + randomBytes(12).toString('hex');
   res.writeHead(200, {
@@ -185,25 +209,25 @@ async function writeAnthropicStream(res, first, iterator, opts) {
   let nextIndex = 0;
   let textIndex = null;
   let thinkIndex = null;
-  const toolIndex = new Map();
-  const tools = new Map();
+  const calls = new Map();
   let finish = 'stop';
+  let sawFinish = false;
   let usage;
 
   const close = (i) => send({ type: 'content_block_stop', index: i });
-  // 关掉所有还开着的块。以前只关 text/thinking，工具块留着不关：
-  // 上游如果先吐工具、又吐出文本，就会在 tool_use 块还是打开状态时开始新的 text 块，
-  // Anthropic 的事件顺序要求每个块 start→…→stop 完整闭合，否则 SDK 会报解析错。
-  const closeTools = () => {
-    for (const [key, idx] of toolIndex) {
-      close(idx);
-      toolIndex.delete(key);
-    }
-  };
   const closeOpen = () => {
     if (textIndex !== null) { close(textIndex); textIndex = null; }
     if (thinkIndex !== null) { close(thinkIndex); thinkIndex = null; }
-    closeTools();
+  };
+  // 整轮读完后再把攒好的工具调用逐块吐出：start → 完整 arguments → stop。
+  const flushToolCalls = () => {
+    for (const c of calls.values()) {
+      const idx = nextIndex++;
+      const blockId = c.id || 'toolu_' + randomBytes(10).toString('hex');
+      send({ type: 'content_block_start', index: idx, content_block: { type: 'tool_use', id: blockId, name: c.name, input: {} } });
+      if (c.args) send({ type: 'content_block_delta', index: idx, delta: { type: 'input_json_delta', partial_json: c.args } });
+      close(idx);
+    }
   };
 
   try {
@@ -213,7 +237,7 @@ async function writeAnthropicStream(res, first, iterator, opts) {
       const ch = c && c.choices && c.choices[0];
       if (!ch) continue;
       const d = ch.delta || ch.message || {};
-      if (typeof ch.finish_reason === 'string') finish = ch.finish_reason;
+      if (typeof ch.finish_reason === 'string') { finish = ch.finish_reason; sawFinish = true; }
 
       const reasoning = d.reasoning_content ?? d.reasoning;
       if (typeof reasoning === 'string' && reasoning) {
@@ -226,8 +250,6 @@ async function writeAnthropicStream(res, first, iterator, opts) {
 
       if (typeof d.content === 'string' && d.content) {
         if (thinkIndex !== null) { close(thinkIndex); thinkIndex = null; }
-        // 文本比工具晚到时，先把开着的工具块闭合，再开文本块
-        if (toolIndex.size) closeTools();
         if (textIndex === null) {
           textIndex = nextIndex++;
           send({ type: 'content_block_start', index: textIndex, content_block: { type: 'text', text: '' } });
@@ -236,33 +258,14 @@ async function writeAnthropicStream(res, first, iterator, opts) {
       }
 
       if (Array.isArray(d.tool_calls)) {
-        for (const t of d.tool_calls) {
-          const key = t.index ?? 0;
-          if (!toolIndex.has(key)) {
-            closeOpen();
-            const idx = nextIndex++;
-            toolIndex.set(key, idx);
-            const block = {
-              id: (t.id && String(t.id)) || 'toolu_' + randomBytes(10).toString('hex'),
-              name: (t.function && t.function.name) || '',
-              args: '',
-            };
-            tools.set(idx, block);
-            send({ type: 'content_block_start', index: idx, content_block: { type: 'tool_use', id: block.id, name: block.name, input: {} } });
-          }
-          const idx = toolIndex.get(key);
-          const block = tools.get(idx);
-          if (t.id) block.id = String(t.id);
-          if (t.function && typeof t.function.name === 'string' && t.function.name) block.name = t.function.name;
-          if (t.function && typeof t.function.arguments === 'string' && t.function.arguments) {
-            block.args += t.function.arguments;
-            send({ type: 'content_block_delta', index: idx, delta: { type: 'input_json_delta', partial_json: t.function.arguments } });
-          }
-        }
+        for (const t of d.tool_calls) collectToolCall(calls, t);
       }
     }
 
+    if (!sawFinish) throw truncatedUpstreamError();
+
     closeOpen();
+    flushToolCalls();
 
     send({
       type: 'message_delta',
@@ -270,8 +273,10 @@ async function writeAnthropicStream(res, first, iterator, opts) {
       usage: { output_tokens: (usage && usage.completion_tokens) || 0 },
     });
     send({ type: 'message_stop' });
+    if (opts) opts.usage = usage;
     res.end();
   } catch (e) {
+    if (opts) opts.usage = usage;
     send({ type: 'error', error: { type: 'api_error', message: e.message } });
     res.end();
   }
@@ -282,6 +287,7 @@ async function anthropicMessage(first, iterator, opts) {
   let thinking = '';
   const calls = new Map();
   let finish = 'stop';
+  let sawFinish = false;
   let usage;
 
   for (let s = first; !s.done; s = await iterator.next()) {
@@ -290,21 +296,17 @@ async function anthropicMessage(first, iterator, opts) {
     const ch = c && c.choices && c.choices[0];
     if (!ch) continue;
     const d = ch.delta || ch.message || {};
-    if (typeof ch.finish_reason === 'string') finish = ch.finish_reason;
+    if (typeof ch.finish_reason === 'string') { finish = ch.finish_reason; sawFinish = true; }
     if (typeof d.content === 'string') text += d.content;
     const r = d.reasoning_content ?? d.reasoning;
     if (typeof r === 'string') thinking += r;
     if (Array.isArray(d.tool_calls)) {
-      for (const t of d.tool_calls) {
-        const key = t.index ?? 0;
-        const cur = calls.get(key) || { id: '', name: '', args: '' };
-        if (t.id) cur.id = String(t.id);
-        if (t.function && typeof t.function.name === 'string' && t.function.name) cur.name = t.function.name;
-        if (t.function && typeof t.function.arguments === 'string') cur.args += t.function.arguments;
-        calls.set(key, cur);
-      }
+      for (const t of d.tool_calls) collectToolCall(calls, t);
     }
   }
+
+  if (opts) opts.usage = usage;
+  if (!sawFinish) throw truncatedUpstreamError();
 
   const content = [];
   if (thinking) content.push({ type: 'thinking', thinking });
@@ -494,6 +496,7 @@ async function writeResponsesStream(res, first, iterator, opts) {
   const callIndex = new Map();
   const calls = new Map();
   let finish = 'stop';
+  let sawFinish = false;
   let usage;
 
   const ensureMessage = () => {
@@ -511,7 +514,7 @@ async function writeResponsesStream(res, first, iterator, opts) {
       const ch = c && c.choices && c.choices[0];
       if (!ch) continue;
       const d = ch.delta || ch.message || {};
-      if (typeof ch.finish_reason === 'string') finish = ch.finish_reason;
+      if (typeof ch.finish_reason === 'string') { finish = ch.finish_reason; sawFinish = true; }
 
       if (typeof d.content === 'string' && d.content) {
         ensureMessage();
@@ -550,7 +553,10 @@ async function writeResponsesStream(res, first, iterator, opts) {
       }
     }
 
+    if (!sawFinish) throw truncatedUpstreamError();
+
     const state = responsesStatusOf(finish);
+    if (opts) opts.usage = usage;
     // 子项（message / function_call）的状态跟随整体：截断了就不该标 completed
     const itemStatus = state.status === 'completed' ? 'completed' : 'incomplete';
     const output = [];
@@ -578,6 +584,7 @@ async function writeResponsesStream(res, first, iterator, opts) {
     send({ type: `response.${state.status}`, response: completed });
     res.end();
   } catch (e) {
+    if (opts) opts.usage = usage;
     send({ type: 'response.failed', response: { ...base(), status: 'failed', error: { code: 'upstream_error', message: e.message } } });
     res.end();
   }
@@ -587,6 +594,7 @@ async function responsesMessage(first, iterator, opts) {
   let text = '';
   const calls = new Map();
   let finish = 'stop';
+  let sawFinish = false;
   let usage;
 
   for (let s = first; !s.done; s = await iterator.next()) {
@@ -595,7 +603,7 @@ async function responsesMessage(first, iterator, opts) {
     const ch = c && c.choices && c.choices[0];
     if (!ch) continue;
     const d = ch.delta || ch.message || {};
-    if (typeof ch.finish_reason === 'string') finish = ch.finish_reason;
+    if (typeof ch.finish_reason === 'string') { finish = ch.finish_reason; sawFinish = true; }
     if (typeof d.content === 'string') text += d.content;
     if (Array.isArray(d.tool_calls)) {
       for (const t of d.tool_calls) {
@@ -608,6 +616,9 @@ async function responsesMessage(first, iterator, opts) {
       }
     }
   }
+
+  if (opts) opts.usage = usage;
+  if (!sawFinish) throw truncatedUpstreamError();
 
   const state = responsesStatusOf(finish);
   const itemStatus = state.status === 'completed' ? 'completed' : 'incomplete';
