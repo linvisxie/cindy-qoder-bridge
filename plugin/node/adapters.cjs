@@ -270,7 +270,7 @@ async function writeAnthropicStream(res, first, iterator, opts) {
     send({
       type: 'message_delta',
       delta: { stop_reason: ANTHROPIC_STOP[finish] || 'end_turn', stop_sequence: null },
-      usage: { input_tokens: usage?.prompt_tokens ?? opts.inputTokens ?? 0, output_tokens: (usage && usage.completion_tokens) || 0 },
+      usage: anthropicUsage(usage, opts.inputTokens),
     });
     send({ type: 'message_stop' });
     if (opts) opts.usage = usage;
@@ -328,7 +328,7 @@ async function anthropicMessage(first, iterator, opts) {
     content,
     stop_reason: ANTHROPIC_STOP[finish] || 'end_turn',
     stop_sequence: null,
-    usage: { input_tokens: usage?.prompt_tokens ?? opts.inputTokens ?? 0, output_tokens: (usage && usage.completion_tokens) || 0 },
+    usage: anthropicUsage(usage, opts.inputTokens),
   };
 }
 
@@ -458,14 +458,42 @@ function responsesStatusOf(finish) {
   return { status: 'completed' };
 }
 
+// 上游 Qoder 的 usage 里本来就带缓存与推理明细（实测：
+//   prompt_tokens_details.cached_tokens、completion_tokens_details.reasoning_tokens）。
+// 以前这里把两个 details 写死成 0，Cindy 读到的缓存命中率永远是 0——不是没缓存，
+// 是我们把真值丢了。现在原样透传，只在上游真没给时才落 0。
+function census(usage) {
+  const cached = usage?.prompt_tokens_details?.cached_tokens;
+  const reasoning = usage?.completion_tokens_details?.reasoning_tokens;
+  return {
+    cached: Number.isFinite(cached) ? cached : 0,
+    reasoning: Number.isFinite(reasoning) ? reasoning : 0,
+  };
+}
+
+// Anthropic 的缓存命中走 cache_read_input_tokens，语义与 OpenAI 的
+// cached_tokens 一致（都表示「输入里命中缓存的那部分」）。Cindy 靠它算命中率，
+// 不填的话界面会一律显示 0%，看着像缓存坏了。
+function anthropicUsage(usage, inputTokens) {
+  const inp = usage?.prompt_tokens ?? inputTokens ?? 0;
+  const out = (usage && usage.completion_tokens) || 0;
+  const det = census(usage);
+  return {
+    input_tokens: inp,
+    ...(det.cached ? { cache_read_input_tokens: det.cached } : {}),
+    output_tokens: out,
+  };
+}
+
 function responsesUsage(usage, inputTokens) {
   const out = (usage && usage.completion_tokens) || 0;
   const inp = usage?.prompt_tokens ?? inputTokens ?? 0;
+  const det = census(usage);
   return {
     input_tokens: inp,
-    input_tokens_details: { cached_tokens: 0 },
+    input_tokens_details: { cached_tokens: det.cached },
     output_tokens: out,
-    output_tokens_details: { reasoning_tokens: 0 },
+    output_tokens_details: { reasoning_tokens: det.reasoning },
     total_tokens: inp + out,
   };
 }
@@ -658,4 +686,7 @@ module.exports = {
   writeResponsesStream,
   responsesMessage,
   estimateTokens,
+  anthropicUsage,
+  responsesUsage,
+  census,
 };

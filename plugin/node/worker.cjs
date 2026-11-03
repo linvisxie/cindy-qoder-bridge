@@ -355,7 +355,26 @@ let modelsAt = 0;
 let server;
 let actualPort = 0;
 let token = '';
-let lastError = '';
+// 错误状态按来源分开存：模型目录挂了不该被一次成功的额度刷新清掉，反之亦然。
+// 每项形如 { msg, at }，at 是失败发生的时刻——面板要能显示「多久以前」，
+// 否则一条启动瞬间的瞬时抖动会一直挂着，看着像现在坏了。
+const errors = { models: null, usage: null };
+function setError(source, msg) {
+  if (msg) errors[source] = { msg, at: Date.now() };
+  else if (source) delete errors[source];
+  else for (const k of Object.keys(errors)) errors[k] = null;
+}
+// 对外一个字符串：取最新那条，并标出多久以前失败的。
+function lastErrorText(now = Date.now()) {
+  const live = Object.entries(errors).filter(([, v]) => v && v.msg);
+  if (!live.length) return '';
+  live.sort((a, b) => b[1].at - a[1].at);
+  const [source, v] = live[0];
+  const ago = Math.max(0, Math.round((now - v.at) / 1000));
+  const when = ago < 60 ? `${ago} 秒前` : ago < 3600 ? `${Math.round(ago / 60)} 分钟前` : `${Math.round(ago / 3600)} 小时前`;
+  const tag = source === 'usage' ? '额度' : '模型目录';
+  return `（${when}）${v.msg}${tag === '额度' ? '——额度数字可能不是最新的' : ''}`;
+}
 let lastQuota;
 let bootedAt = 0;
 let lastCheckin;
@@ -473,10 +492,11 @@ async function refreshModels(force) {
     modelsAt = Date.now();
     saveState({});
     try { mkdirSync(DATA_DIR, { recursive: true }); writeFileSync(cache, JSON.stringify(models, null, 1)); } catch {}
+    setError('models', null);  // 这次拉到了，上一次的失败就不该再挂着
     return models;
   } catch (e) {
-    lastError = `模型目录刷新失败：${e.message}`;
-    log(lastError);
+    setError('models', `模型目录刷新失败：${e.message}`);
+    log(`模型目录刷新失败：${e.message}`);
     try { models = JSON.parse(readFileSync(cache, 'utf8')); } catch {}
     return models;
   }
@@ -558,7 +578,7 @@ async function refreshUsage(force) {
       // 拿不到额度时不能假装没事：lastQuota 保留旧值但打上 stale，
       // 否则面板会一直显示上一次的「已用 843 / 2000」，看不出早就读失败了。
       const why = `额度读取失败（HTTP ${presentation.status ?? '?'} / ${legacy.status ?? '?'}）`;
-      lastError = why;
+      setError('usage', why);
       lastUsage = { ...(lastUsage || {}), at: Date.now(), error: why };
       if (lastQuota) lastQuota = { ...lastQuota, stale: true, staleReason: why };
       return lastUsage;
@@ -604,6 +624,7 @@ async function refreshUsage(force) {
     }
     : { total: 0, used: 0, remaining: 0, exceeded: lastUsage.exceeded, note: '该账号套餐没有 Credits 配额（可能是免费额度）' };
 
+  setError('usage', null);  // 这次读到了，上一次的失败就不该再挂着
   return lastUsage;
 }
 
@@ -1604,7 +1625,9 @@ async function buildStatus() {
     localUsage: usageSummary(),
     logFile: LOG_FILE,
     uptimeSeconds: Math.floor((Date.now() - bootedAt) / 1000),
-    lastError,
+    // 只报还活着的错误（成功刷新会按来源清掉），并带上「多久以前」。
+    lastError: lastErrorText(),
+    quotaStale: Boolean(lastQuota && lastQuota.stale),
     ...(cred ? {} : { hint: '请先在 Qoder CN 客户端登录，然后在插件里点「刷新」。' }),
   };
 }

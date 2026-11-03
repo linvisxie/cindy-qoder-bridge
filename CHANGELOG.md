@@ -4,6 +4,33 @@
 
 ---
 
+## 0.1.18
+
+**2026-11-04** · 修两处「数字变成 0」的假象，以及一条永不消失的红字
+
+### 修了什么
+
+1. **缓存命中率恒为 0，但上游其实命中了**（P1）。Cindy 里「缓存 读 0 · 写 0 · 命中 0%」看着像上游不支持缓存，实际是适配层把真值丢了：`input_tokens_details.cached_tokens` 和 `output_tokens_details.reasoning_tokens` 都硬编码成 0。上游给的是真的——实测同一个前缀连发三次，`cached_tokens` 稳定为 **1792 / 2034（命中 88%）**。现在 `census()` 把两项原样透传，只在上游真没给时才落 0。
+
+2. **Anthropic 协议根本不报缓存命中**。`/v1/messages` 的 `message_delta` 以前只有 `input_tokens` / `output_tokens`，而 Cindy 算命中率读的是 `cache_read_input_tokens`，字段不存在自然就是 0%。现在补上；该字段只在真有命中时出现，避免把「不支持缓存」和「命中 0」混为一谈。
+
+3. **一条瞬时失败会永久挂在面板上**（P2）。线上实测：worker 启动后 10 秒，后台补额度失败一次（`fetch failed`）；8 分钟后额度其实已经刷新成功（`quota.stale = false`、数字是新的），面板那行红字却还在——因为 `lastError` 在整个文件里**只有赋值，没有任何一处清空**。现在按来源分别记账（`models` / `usage`）：
+
+   - 成功刷新只清自己那一项，模型成功不会误清额度错误，反之亦然；
+   - 错误带时间戳，显示成「（12 分钟前）额度读取失败：…」，一眼看出是旧账；
+   - 额度是旧值时面板在数字后标「（旧值）」，不让上一次的数字冒充当前的。
+
+### 加了什么
+
+- 8 项离线回归：缓存/推理明细必须透传、真实 0 不能被当成缺失、Anthropic 必须报 `cache_read_input_tokens`、成功刷新必须清掉自己的失败、不同来源互不误清、时间戳分档（秒/分钟/小时）、`quotaStale` 标记。
+- `adapters.cjs` 导出 `anthropicUsage` / `responsesUsage` / `census` 以便测试。
+
+### 测试
+
+`review-regressions 27/27`、`update-chain 51/0`、`host-guard 13/0`、`responses-status 19/0`、`upstream-contract 16/0（1 跳过）`、`features 42/0`、`e2e-package 25/0`、`e2e-brain 13/13`、`verify-manifest PASS`。
+
+**边界**：命中率是否真在 Cindy 界面显示出来，需要桌面端实际对话一次才看得到；本轮只验证到端点返回的 usage 已带真值。
+
 ## 0.1.17
 
 **2026-11-03** · 修输入用量记账与自更新的两个假象（issue #10）

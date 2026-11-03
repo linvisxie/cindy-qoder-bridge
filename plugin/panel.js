@@ -79,10 +79,12 @@
     $('port').textContent = st.port || '—';
 
     const q = st.quota;
+    // 额度是旧值时明确标出来，别让「上一次的数字」冒充「现在的数字」。
+    const stale = q && q.stale ? '（旧值）' : '';
     if (q && typeof q.total === 'number' && q.total > 0) {
-      $('quota').textContent = `已用 ${q.used} / ${q.total}（${Math.round(q.used / q.total * 100)}%）`;
+      $('quota').textContent = `已用 ${q.used} / ${q.total}（${Math.round(q.used / q.total * 100)}%）${stale}`;
     } else {
-      $('quota').textContent = (q && q.note) ? q.note : '—';
+      $('quota').textContent = ((q && q.note) ? q.note : '—') + stale;
     }
 
     if (st.lastError) { $('err').hidden = false; $('err').textContent = st.lastError; }
