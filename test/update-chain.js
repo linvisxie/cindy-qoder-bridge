@@ -208,13 +208,69 @@ try {
 
 console.log('\n=== 第 5 组：两份 update.cjs 必须一致 ===');
 
-// 两个仓库的这份文件应当逐字相同（跟 adapters.cjs 同一个约定）
-const mine = readFileSync(join(__dirname, '..', 'plugin', 'node', 'update.cjs'), 'utf8');
-if (process.env.UPDATE_TWIN) {
-  const twin = readFileSync(process.env.UPDATE_TWIN, 'utf8');
-  eq(mine === twin, true, '与另一个仓库的 update.cjs 逐字相同');
+// 两个仓库的这份文件应当逐字相同（跟 adapters.cjs 同一个约定，见 HANDOFF 第 2 节）。
+//
+// 这里不靠人记得设环境变量 —— 默认就去同级目录里找另一个仓库的 update.cjs。
+// 目录布局是 <父目录>\qoderbridge开源\ 与 <父目录>\traebridge\，所以从
+// <仓库>/test/ 往上两层就是父目录，扫一遍它的子目录即可。
+// UPDATE_TWIN 仍然可用，用于仓库不在同一父目录下的情况（比如单独 clone）。
+const REPO_ROOT = join(__dirname, '..');
+const mine = readFileSync(join(REPO_ROOT, 'plugin', 'node', 'update.cjs'), 'utf8');
+
+function findTwin() {
+  if (process.env.UPDATE_TWIN) return { path: process.env.UPDATE_TWIN, source: 'UPDATE_TWIN' };
+  const parent = join(REPO_ROOT, '..');
+  let entries = [];
+  try { entries = require('node:fs').readdirSync(parent, { withFileTypes: true }); } catch { return undefined; }
+  for (const e of entries) {
+    if (!e.isDirectory()) continue;
+    const cand = join(parent, e.name, 'plugin', 'node', 'update.cjs');
+    // 跳过自己（自己那份比上来必然相等，不属于「双仓库」校验）
+    if (join(parent, e.name) === REPO_ROOT) continue;
+    if (existsSync(cand)) return { path: cand, source: `同级仓库 ${e.name}` };
+  }
+  return undefined;
+}
+
+const twinFile = findTwin();
+if (!twinFile) {
+  skip('找不到同级仓库的 update.cjs（可设 UPDATE_TWIN 指定路径），跳过双仓库一致性断言');
 } else {
-  skip('未设置 UPDATE_TWIN，跳过双仓库一致性断言');
+  const twin = readFileSync(twinFile.path, 'utf8');
+  if (mine === twin) {
+    ok(`与另一个仓库的 update.cjs 逐字相同（${twinFile.source}）`);
+  } else {
+    // 不一致时给出具体差异行，光说「不一样」等于没说。
+    const a = mine.split('\n');
+    const b = twin.split('\n');
+    const diffs = [];
+    for (let i = 0; i < Math.max(a.length, b.length); i++) {
+      if (a[i] !== b[i]) diffs.push(`第 ${i + 1} 行：本仓库 ${JSON.stringify(a[i])} ≠ 对方 ${JSON.stringify(b[i])}`);
+      if (diffs.length >= 5) { diffs.push('……（还有更多差异）'); break; }
+    }
+    bad(`与另一个仓库的 update.cjs 不一致（${twinFile.source}）—— 两份必须逐字相同，改一处就得改两处`);
+    for (const d of diffs) console.log('      ' + d);
+  }
+}
+
+// adapters.cjs 允许 2 行注释差异（约定好的），所以只校验「除注释外是否同构」：
+// 去掉空行和以 // 开头的行后比较，两边应当完全一致。这条能抳住「只改了一边」的失误。
+const adaptersMine = readFileSync(join(REPO_ROOT, 'plugin', 'node', 'adapters.cjs'), 'utf8');
+function stripComments(src) {
+  return src.split('\n')
+    .map((l) => l.trim())
+    .filter((l) => l !== '' && !l.startsWith('//'))
+    .join('\n');
+}
+if (twinFile) {
+  const adaptersTwinPath = join(require('node:path').dirname(twinFile.path), 'adapters.cjs');
+  if (existsSync(adaptersTwinPath)) {
+    const adaptersTwin = readFileSync(adaptersTwinPath, 'utf8');
+    eq(stripComments(adaptersMine) === stripComments(adaptersTwin), true,
+      'adapters.cjs 除注释外与另一仓库一致（只允许注释不同）');
+  } else {
+    skip('同级仓库没有 adapters.cjs，跳过适配层一致性断言');
+  }
 }
 
 console.log(`\n结果：${pass} 通过，${fail} 失败${skips.length ? `，${skips.length} 跳过` : ''}`);
