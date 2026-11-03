@@ -132,6 +132,44 @@ function extractZipTo(buf, targetDir) {
   return names;
 }
 
+// Validate the archive itself before extraction: a stale directory must not fill missing entries.
+function validatePackage(entries, expected) {
+  const files = new Map();
+  const safePath = (value) => {
+    if (typeof value !== 'string' || !value || /[\\:]/.test(value) || value.startsWith('/')) return false;
+    return value.split('/').every((part) => part && part !== '.' && part !== '..');
+  };
+  for (const entry of entries) {
+    if (!safePath(entry.name) || files.has(entry.name)) throw new Error('更新包条目路径无效或重复：' + entry.name);
+    files.set(entry.name, entry.data);
+  }
+  if (!files.has('ghost.json')) throw new Error('更新包缺少 ghost.json');
+  let manifest;
+  try { manifest = JSON.parse(files.get('ghost.json').toString('utf8')); }
+  catch { throw new Error('更新包 ghost.json 不是合法 JSON'); }
+  if (!manifest || manifest.id !== expected.id) throw new Error('更新包插件 ID 不匹配');
+  if (manifest.schemaVersion !== 3) throw new Error('更新包清单版本不受支持');
+  if (manifest.version !== expected.version || compareVersion(manifest.version, expected.currentVersion) <= 0) {
+    throw new Error('更新包版本与目标发布不匹配或不是更新版本');
+  }
+  const required = [manifest.entry, manifest.node && manifest.node.entry, manifest.panel && manifest.panel.html,
+    'main.js', 'panel.js', 'panel.html', 'node/worker.cjs', ...(expected.required || [])];
+  for (const name of required) {
+    if (!safePath(name) || !files.has(name)) throw new Error('更新包缺少或非法入口：' + name);
+  }
+  return manifest;
+}
+
+// spawn() may return a child and emit ENOENT/EACCES asynchronously.
+function waitForSpawn(child) {
+  return new Promise((resolve, reject) => {
+    const onError = (error) => { child.removeListener('spawn', onSpawn); reject(error); };
+    const onSpawn = () => { child.removeListener('error', onError); resolve(child); };
+    child.once('error', onError);
+    child.once('spawn', onSpawn);
+  });
+}
+
 // ---------- 生成的脚本 ----------
 
 // PowerShell 单引号字符串里再转义单引号，路径带空格/引号也不会被截断。
@@ -171,6 +209,7 @@ function buildApplyScript(opts) {
     `  if (Test-Path $stage) { Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue }`,
     `  if (Test-Path $pkg) { Remove-Item $pkg -Force -ErrorAction SilentlyContinue }`,
     `  if (Test-Path $sync) { Remove-Item $sync -Force -ErrorAction SilentlyContinue }`,
+    `  if ($PSCommandPath) { Remove-Item $PSCommandPath -Force -ErrorAction SilentlyContinue }`,
     `}`,
   ].join('\r\n');
 }
@@ -243,6 +282,8 @@ module.exports = {
   parseDigest,
   verifyDigest,
   readZipEntries,
+  validatePackage,
+  waitForSpawn,
   extractZipTo,
   psQuote,
   buildApplyScript,

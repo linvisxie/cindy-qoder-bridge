@@ -270,7 +270,7 @@ async function writeAnthropicStream(res, first, iterator, opts) {
     send({
       type: 'message_delta',
       delta: { stop_reason: ANTHROPIC_STOP[finish] || 'end_turn', stop_sequence: null },
-      usage: { output_tokens: (usage && usage.completion_tokens) || 0 },
+      usage: { input_tokens: usage?.prompt_tokens ?? opts.inputTokens ?? 0, output_tokens: (usage && usage.completion_tokens) || 0 },
     });
     send({ type: 'message_stop' });
     if (opts) opts.usage = usage;
@@ -328,7 +328,7 @@ async function anthropicMessage(first, iterator, opts) {
     content,
     stop_reason: ANTHROPIC_STOP[finish] || 'end_turn',
     stop_sequence: null,
-    usage: { input_tokens: opts.inputTokens || 0, output_tokens: (usage && usage.completion_tokens) || 0 },
+    usage: { input_tokens: usage?.prompt_tokens ?? opts.inputTokens ?? 0, output_tokens: (usage && usage.completion_tokens) || 0 },
   };
 }
 
@@ -460,7 +460,7 @@ function responsesStatusOf(finish) {
 
 function responsesUsage(usage, inputTokens) {
   const out = (usage && usage.completion_tokens) || 0;
-  const inp = (usage && usage.prompt_tokens) || inputTokens || 0;
+  const inp = usage?.prompt_tokens ?? inputTokens ?? 0;
   return {
     input_tokens: inp,
     input_tokens_details: { cached_tokens: 0 },
