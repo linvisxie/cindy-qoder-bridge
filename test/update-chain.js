@@ -68,8 +68,12 @@ eq(r4.ok, false, '无 digest 但 size 不符时拒绝');
 truthy(/被截断/.test(r4.reason || ''), 'size 不符时提示可能被截断');
 
 const r5 = updater.verifyDigest(bytes, undefined, undefined);
-eq(r5.ok, true, '两者都没有时放行');
-eq(r5.skipped, true, '两者都没有时标记 skipped，让调用方记日志');
+eq(r5.ok, false, '两者都没有时拒绝（fail-closed，不零校验安装）');
+truthy(/无法校验/.test(r5.reason || ''), '双缺失拒绝理由说清是无法校验');
+
+// digest 给了但格式坏了也不能静默降级成只看大小
+const r7 = updater.verifyDigest(bytes, 'sha256:ZZZ-not-hex!!', bytes.length);
+eq(r7.ok, false, 'digest 格式非法时拒绝（不降级为 size 校验）');
 
 // 不认识的算法不能静默放行
 const r6 = updater.verifyDigest(bytes, 'md5:abc123', bytes.length);

@@ -53,10 +53,18 @@ function parseDigest(value) {
 /**
  * 校验下载到的字节。
  * 返回 { ok:true, ... } 或 { ok:false, reason }。
- * 没有 digest 时退回按 size 校验；两个都没有就 ok + skipped（不阻断安装，但调用方会记日志）。
+ * 没有 digest 时退回按 size 校验；digest 给了但格式解析不了、或两个都没给，
+ * 一律拒绝安装（fail-closed）：更新是最高风险动作，不能存在「零完整性
+ * 信息也装」或「坏 digest 静默降级成只看大小」的路径。
  */
 function verifyDigest(buf, digest, size) {
   const parsed = parseDigest(digest);
+  if (!parsed && digest != null && String(digest).trim() !== '') {
+    return {
+      ok: false,
+      reason: `发布记录里的 digest 格式无法解析（期望 sha256:<十六进制>），已放弃安装，安装目录未改动。`,
+    };
+  }
   if (parsed) {
     if (parsed.alg !== 'sha256') {
       return { ok: false, reason: `发布记录里的 digest 用的是不认识的算法 ${parsed.alg}，只支持 sha256` };
@@ -77,7 +85,10 @@ function verifyDigest(buf, digest, size) {
       reason: `下载包大小 ${buf.length} 字节与发布记录的 ${size} 字节不符（大概率被截断），已放弃安装，安装目录未改动。`,
     };
   }
-  return { ok: true, skipped: true };
+  return {
+    ok: false,
+    reason: '发布记录既没给 digest 也没给大小，无法校验下载包的完整性，已放弃安装，安装目录未改动。',
+  };
 }
 
 // ---------- zip 解包 ----------
@@ -201,10 +212,21 @@ function buildApplyScript(opts) {
     `try {`,
     `  try { Wait-Process -Id $oldPid -Timeout 60 -ErrorAction SilentlyContinue } catch {}`,
     `  Start-Sleep -Milliseconds 300`,
-    `  if (-not (Test-Path $backup)) { Copy-Item $root $backup -Recurse -Force }`,
-    `  Copy-Item (Join-Path $stage '*') $root -Recurse -Force`,
-    // 清单快照必须在删掉 $pkg 之前同步（它要算这个包的 sha256）。
-    `  if ((Test-Path $sync) -and (Test-Path $nodeExe)) { try { & $nodeExe $sync } catch {} }`,
+    // 备份每次都刷新：同版本重试时沿用上次的旧备份，回滚点会比预期更老。
+    `  if (Test-Path $backup) { Remove-Item $backup -Recurse -Force }`,
+    `  Copy-Item $root $backup -Recurse -Force`,
+    // 覆盖或同步中途失败就从备份还原，别把新旧混杂的目录留给用户手工收拾。
+    `  try {`,
+    `    Copy-Item (Join-Path $stage '*') $root -Recurse -Force`,
+    // 清单快照必须在删掉 $pkg 之前同步（它要算这个包的 sha256）；同步本身仍是尽力而为，不触发回滚。
+    `    if ((Test-Path $sync) -and (Test-Path $nodeExe)) { try { & $nodeExe $sync } catch {} }`,
+    `  } catch {`,
+    `    try {`,
+    `      Get-ChildItem $root -Force | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue`,
+    `      Copy-Item (Join-Path $backup '*') $root -Recurse -Force`,
+    `    } catch {}`,
+    `    throw`,
+    `  }`,
     `} finally {`,
     `  if (Test-Path $stage) { Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue }`,
     `  if (Test-Path $pkg) { Remove-Item $pkg -Force -ErrorAction SilentlyContinue }`,
