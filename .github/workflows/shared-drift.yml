@@ -60,7 +60,7 @@ jobs:
           if git clone --depth 1 "https://github.com/${TWIN}.git" twin; then
             echo 'found=true' >> "$GITHUB_OUTPUT"
           else
-            echo '::warning::clone 另一个仓库失败（$TWIN），跳过漂移检查'
+            echo "::warning::clone 另一个仓库失败（$TWIN），跳过漂移检查"
             echo 'found=false' >> "$GITHUB_OUTPUT"
           fi
 
