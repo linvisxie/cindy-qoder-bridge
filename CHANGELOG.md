@@ -4,6 +4,33 @@
 
 ---
 
+## 0.1.16
+
+**2026-11-03** · 把自更新链路补成可靠的，并加英文 README
+
+### 修了什么
+
+1. **自更新不校验下载包**（P1）。`applyUpdate()` 以前下载完直接 `extractZipTo` 覆盖安装目录，没有任何完整性校验 —— CDN 截断或中间人替换时，worker 已经 `process.exit(0)`，Cindy 拉起的就是一份坏代码，只能靠 `.bak-<旧版本>` 手工回滚。现在下载后先比 `asset.digest`（GitHub Releases 自带 `sha256:…`，与本机 dist 包、Cindy 记的 `packageSha256` 三方一致），不一致就抛错、**一个字节都不写进安装目录**，当前版本继续跑。没有 digest 时退回按 `size` 校验；两者都没有才放行并记日志。
+
+2. **自更新成功后不刷新 Cindy 的清单快照**（P1）。Cindy 的「插件管理」页读的是 `ghost-install-state/_ns/_root/<id>.json` 的 `manifest` 与 `plugin-instances.v2.json` 的 `packageSha256`，不是运行中的 `ghost.json`。自更新只覆盖运行文件，于是管理页会退回旧版本 —— 正是 0.1.7 那条 CHANGELOG 自己写的问题。现在替换脚本会在装完后调一个自动生成的 node 脚本同步两处，`receiptRevision` 也一并换新。owner 目录从安装位置反推，不写死任何本机路径。
+
+3. **暂存目录与下载包失败时残留**（P2）。清理以前只写在 PowerShell 脚本最后一行，`$ErrorActionPreference='Stop'` 一旦中途抛错就跳过清理，反复失败会一直往 `update/` 里堆。现在清理放进 `finally`，且下载包和临时同步脚本也一并删。
+
+### 加了什么
+
+- **`plugin/node/update.cjs`**。把版本比较、digest 校验、zip 解包、PowerShell 脚本生成、清单快照同步脚本生成这几段纯函数从 `worker.cjs` 里抽出来。抽出来的理由是它们本来就能离线验证，却因为藏在 worker 里（一 `require` 就 `boot()`）而一条测试都没有。
+- **`test/update-chain.js`**，50 项离线回归：`0.1.15` 必须比 `0.1.9` 新（按段比，不是按字符串比）、哈希不符必须拒绝、zip slip 必须挡住、生成的脚本必须等旧进程 / 备份 / 同步快照、路径里的单引号必须正确转义、两份 `update.cjs` 必须逐字相同。
+- **英文 README**（`README.en.md`），两个语言版本顶部互相可点切换。
+
+### 顺带
+
+- `parseDigest` 对 `SHA256:` 这种大写算法名原本返回 `undefined`（正则没加 `i`），导致一条合法 digest 被当成「没有 digest」而静默降级。已修，并有测试钉住。
+- `pack.cjs` 清单加上 `node/update.cjs`；`e2e-package.js` 的必需文件断言同步加上。
+
+### 测试
+
+`update-chain 50/0`、`host-guard 13/0`、`responses-status 19/0`、`upstream-contract 16/0`、`e2e-package 25/0`、`e2e-panel 10/10`、`e2e-brain 13/13`、`verify-manifest PASS`。
+
 ## 0.1.15
 
 **2026-11-03** · 新增「检查更新」

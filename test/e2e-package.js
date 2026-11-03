@@ -30,7 +30,7 @@ try {
 }
 
 // ---- 2. 结构 ----
-const MUST = ['ghost.json', 'main.js', 'panel.html', 'panel.js', join('node', 'worker.cjs'), join('node', 'adapters.cjs')];
+const MUST = ['ghost.json', 'main.js', 'panel.html', 'panel.js', join('node', 'worker.cjs'), join('node', 'adapters.cjs'), join('node', 'update.cjs')];
 for (const rel of MUST) {
   if (existsSync(join(work, rel))) ok(`包含 ${rel}`);
   else bad(`缺少 ${rel}`);

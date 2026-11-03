@@ -3,6 +3,10 @@
 <p align="center"><b>把本机已登录的 Qoder CN 模型接入 Cindy，零配置用你自己的账号额度。</b></p>
 
 <p align="center">
+  <a href="README.en.md"><b>English</b></a> · 简体中文
+</p>
+
+<p align="center">
   <a href="#安装">安装</a> ·
   <a href="#工作原理">工作原理</a> ·
   <a href="#面板能看什么">面板</a> ·
@@ -69,6 +73,7 @@ Qoder 不是 OpenAI 兼容端点，所以需要三样东西：
 | `plugin/main.js` | 电子脑：把 AI 的工具调用与面板请求转给 worker |
 | `plugin/node/worker.cjs` | Node 常驻进程：解密登录态、起 HTTP 服务、三条协议路由 |
 | `plugin/node/adapters.cjs` | Anthropic / Responses 与 OpenAI Chat 之间的协议翻译 |
+| `plugin/node/update.cjs` | 自更新纯函数：版本比较、digest 校验、zip 解包、脚本生成 |
 | `plugin/panel.*` | 右侧栏面板：账号、额度、签到、模型列表、Base URL / API Key |
 
 它**不改 Cindy 的任何文件**，也不替你填供应商配置（Cindy 没给插件这个接口）。它就是给你一个端点，剩下那步在 Cindy 界面里点。
@@ -164,6 +169,7 @@ AI 侧也能问：`qoder_status`、`qoder_endpoint`、`qoder_refresh`、`qoder_c
 | `%APPDATA%\CindyGlobal\qoder-bridge\state.json` | 本地端点 token + 端口 |
 | `%APPDATA%\CindyGlobal\qoder-bridge\models.json` | 模型目录缓存（30 分钟） |
 | `%APPDATA%\CindyGlobal\qoder-bridge\usage.json` | 本地用量账本（按天按模型，留 60 天） |
+| `%APPDATA%\CindyGlobal\qoder-bridge\update\` | 自查更新的下载包、暂存目录与替换脚本 |
 | `%APPDATA%\CindyGlobal\qoder-bridge\bridge.log` | 运行日志，超 2 MB 自动滚成 `.1` |
 
 **你的 Qoder token 不会被写进这些文件** —— 每次都是现从 Qoder 客户端目录里的 `auth.v1.dat` 解密，只在内存里用。
@@ -186,7 +192,9 @@ cd plugin && npm run pack       :: 打包
 
 node test\host-guard.js         :: Host 守卫 13 项（纯本地，不需要登录）
 node test\responses-status.js   :: Responses 状态映射 19 项（纯本地，不需要登录）
-node test\e2e-package.js        :: 包端到端 21 项（解包 → 起 worker → 真对话 → 三条协议）
+node test\upstream-contract.js  :: 上游契约 16 项（纯本地：交错工具分片 / 截断判定 / usage 回传）
+node test\update-chain.js       :: 自更新链路 50 项（纯本地：版本比较 / digest 校验 / 解包 / 脚本生成）
+node test\e2e-package.js        :: 包端到端 25 项（解包 → 起 worker → 真对话 → 三条协议）
 node test\e2e-panel.js          :: 面板脚本 10 项
 node test\e2e-brain.js          :: 面板 ↔ 电子脑真实总线 13 项
 node test\smoke-protocols.js    :: 三条协议形状 19 项
