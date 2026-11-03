@@ -111,7 +111,25 @@ if (packedManifest) {
 }
 
 // ---- 4. 源码与包内容逐字一致：证明包就是这个提交打的 ----
+// 比对对象是 git 里的 blob，不是工作区文件。
+// 差别很实在：工作区可能被编辑器存成 CRLF，产物就会比提交内容多几个字节；
+// 只对工作区会让这种包「验过」，可它在别的机器上重打不出来。
 console.log('\n源码一致性');
+
+const { spawnSync } = require('node:child_process');
+function gitBlob(rel) {
+  const r = spawnSync('git', ['cat-file', 'blob', 'HEAD:' + rel], {
+    cwd: ROOT,
+    maxBuffer: 64 * 1024 * 1024,
+    windowsHide: true,
+  });
+  if (r.status !== 0) return undefined;
+  return r.stdout;
+}
+const hasGit = spawnSync('git', ['rev-parse', '--git-dir'], { cwd: ROOT, windowsHide: true }).status === 0;
+if (!hasGit) {
+  console.log('  --   当前目录不是 git 仓库，退化为比对工作区文件');
+}
 const packagedByRepoPath = {
   'ghost.json': 'plugin/ghost.json',
   'main.js': 'plugin/main.js',
@@ -133,10 +151,16 @@ for (const e of entries) {
   const rel = e.name.replace(/\\/g, '/');
   const repoRel = packagedByRepoPath[rel];
   if (!repoRel) continue;
-  const source = readFileSync(join(ROOT, repoRel));
-  if (!source.equals(e.data)) drift.push(rel);
+  const source = hasGit ? gitBlob(repoRel) : readFileSync(join(ROOT, repoRel));
+  if (!source) { drift.push(rel + '（不在 HEAD 里）'); continue; }
+  if (!source.equals(e.data)) {
+    const hint = source.length !== e.data.length
+      ? '（字节数 ' + e.data.length + ' vs ' + source.length + '，常见原因是工作区被存成了 CRLF）'
+      : '（内容不同）';
+    drift.push(rel + hint);
+  }
 }
-check('包内每个文件都与仓库当前提交逐字一致', drift.length === 0, drift.join(', '));
+check('包内每个文件都与 HEAD 里的内容逐字一致', drift.length === 0, drift.join('; '));
 
 // ---- 5. 不许夹带凭证与开发机私有文件 ----
 console.log('\n干净度');
