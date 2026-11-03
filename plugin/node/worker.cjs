@@ -8,7 +8,7 @@ const http = require('node:http');
 const os = require('node:os');
 const zlib = require('node:zlib');
 const { join } = require('node:path');
-const { existsSync, readFileSync, writeFileSync, mkdirSync, appendFileSync, statSync, renameSync, unlinkSync } = require('node:fs');
+const { existsSync, readFileSync, writeFileSync, mkdirSync, appendFileSync, statSync, renameSync, unlinkSync, mkdtempSync, rmSync } = require('node:fs');
 const { execFileSync } = require('node:child_process');
 const { createDecipheriv, createCipheriv, createHash, randomUUID, publicEncrypt, constants: cryptoConstants } = require('node:crypto');
 const { execFile } = require('node:child_process');
@@ -1421,7 +1421,7 @@ async function anthropicMessages(req, res) {
   } finally {
     up.cancelOnClose.done();
     const out = opts.usage && typeof opts.usage.completion_tokens === 'number' ? opts.usage.completion_tokens : 0;
-    recordUsage(entry, 'anthropic', opts.inputTokens, out);
+    recordUsage(entry, 'anthropic', opts.usage?.prompt_tokens ?? opts.inputTokens, out);
   }
 }
 
@@ -1471,7 +1471,7 @@ async function openaiResponses(req, res) {
   } finally {
     up.cancelOnClose.done();
     const out = opts.usage && typeof opts.usage.completion_tokens === 'number' ? opts.usage.completion_tokens : 0;
-    recordUsage(entry, 'responses', opts.inputTokens, out);
+    recordUsage(entry, 'responses', opts.usage?.prompt_tokens ?? opts.inputTokens, out);
   }
 }
 
@@ -1647,7 +1647,7 @@ async function checkUpdate() {
   if (!res.ok) throw new Error(`查更新失败：GitHub 返回 HTTP ${res.status}`);
   const j = await res.json();
   const latest = String(j.tag_name || '').replace(/^v/i, '');
-  const asset = (Array.isArray(j.assets) ? j.assets : []).find((a) => typeof a.name === 'string' && a.name.endsWith('.cindy'));
+  const asset = (Array.isArray(j.assets) ? j.assets : []).find((a) => a && a.name === 'cindy-qoder-bridge.cindy');
   return {
     current: mine,
     latest,
@@ -1681,7 +1681,6 @@ async function applyUpdate() {
   if (!info.asset) throw new Error('最新 release 里没有 .cindy 包，无法更新');
 
   mkdirSync(UPDATE_DIR, { recursive: true });
-  const pkgPath = join(UPDATE_DIR, `${info.asset.name}`);
   const res = await fetch(info.asset.url, {
     headers: { 'User-Agent': 'qoder-bridge' },
     signal: AbortSignal.timeout(120000),
@@ -1694,29 +1693,36 @@ async function applyUpdate() {
   if (!check.ok) throw new Error(check.reason);
   if (check.skipped) log('发布记录没给 digest 也没给 size，跳过完整性校验');
 
-  writeFileSync(pkgPath, bytes);
-
-  const stageDir = join(UPDATE_DIR, `stage-${info.latest}`);
-  extractZipTo(bytes, stageDir);
-  if (!existsSync(join(stageDir, 'ghost.json'))) throw new Error('新包解出来没有 ghost.json，放弃更新');
-
-  const scriptPath = join(UPDATE_DIR, 'apply-update.ps1');
-  const syncScriptPath = join(UPDATE_DIR, 'sync-snapshot.cjs');
-  const backup = `${INSTALL_DIR}.bak-${info.current}`;
-  writeFileSync(syncScriptPath, updater.buildSnapshotSyncScript({ installDir: INSTALL_DIR, pkgPath }), 'utf8');
-  writeFileSync(scriptPath, updater.buildApplyScript({
-    root: INSTALL_DIR,
-    stage: stageDir,
-    backup,
-    pkg: pkgPath,
-    syncScript: syncScriptPath,
-    nodeExe: process.execPath,
-    oldPid: process.pid,
-  }), 'utf8');
-
-  const child = spawn('powershell.exe', ['-NoProfile', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', scriptPath], {
-    detached: true, stdio: 'ignore', windowsHide: true,
+  // A matching digest proves bytes, not plugin identity or runnable contents.
+  updater.validatePackage(readZipEntries(bytes), {
+    id: 'qoder-bridge', version: info.latest, currentVersion: info.current,
+    required: ['node/adapters.cjs', 'node/update.cjs'],
   });
+
+  const stageDir = mkdtempSync(join(UPDATE_DIR, 'stage-'));
+  // Unique paths also isolate concurrent update attempts and stale staging files.
+  const scriptPath = `${stageDir}.ps1`;
+  const syncScriptPath = `${stageDir}.cjs`;
+  const packagePath = `${stageDir}.cindy`;
+  const backup = `${INSTALL_DIR}.bak-${info.current}`;
+  let child;
+  try {
+    writeFileSync(packagePath, bytes);
+    extractZipTo(bytes, stageDir);
+    writeFileSync(syncScriptPath, updater.buildSnapshotSyncScript({ installDir: INSTALL_DIR, pkgPath: packagePath }), 'utf8');
+    writeFileSync(scriptPath, updater.buildApplyScript({
+      root: INSTALL_DIR, stage: stageDir, backup, pkg: packagePath,
+      syncScript: syncScriptPath, nodeExe: process.execPath, oldPid: process.pid,
+    }), 'utf8');
+    child = spawn('powershell.exe', ['-NoProfile', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', scriptPath], {
+      detached: true, stdio: 'ignore', windowsHide: true,
+    });
+    await updater.waitForSpawn(child);
+  } catch (e) {
+    rmSync(stageDir, { recursive: true, force: true });
+    for (const file of [packagePath, scriptPath, syncScriptPath]) rmSync(file, { force: true });
+    throw new Error(`无法启动更新安装：${e.message}`);
+  }
   child.unref();
 
   // 光交给脚本还不够：脚本里的 Wait-Process 得等到本进程真的退出才动文件。
@@ -1729,7 +1735,7 @@ async function applyUpdate() {
     applied: true,
     backup,
     scriptPath,
-    message: `已下载 ${info.latest} 并交给后台脚本替换；worker 正在退出，Cindy 大约 20~30 秒后用新版本重新拉起。`,
+    message: `已下载 ${info.latest} 并成功启动后台安装脚本；worker 正在退出，Cindy 大约 20~30 秒后用新版本重新拉起。`,
   };
 }
 
