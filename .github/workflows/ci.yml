@@ -76,6 +76,10 @@ jobs:
         shell: pwsh
         run: node plugin/scripts/verify-manifest.cjs
 
+      - name: 发布决策自检（纯函数断言）
+        shell: pwsh
+        run: node .github/scripts/release-plan.cjs --selftest
+
       - name: 版本号一致性（ghost.json / package.json / CHANGELOG）
         shell: pwsh
         run: node .github/scripts/check-version.cjs

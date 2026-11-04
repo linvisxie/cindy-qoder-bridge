@@ -288,19 +288,37 @@ jobs:
           REPO: ${{ github.repository }}
           REPO_NAME: ${{ github.event.repository.name }}
         run: |
-          # 已存在且已公开 -> 不碰它的说明与资产，只补缺的；已存在草稿 -> 更新说明。
+          # 决策逻辑在 .github/scripts/release-plan.cjs（纯函数 + 自检），
+          # 这里只负责按它的结论执行，避免 YAML 内联判断与自检脱节。
           $existing = gh release view $env:TAG --repo $env:REPO --json isDraft,url 2>$null
+          $existsFlag = 'undefined'
+          $existingUrl = ''
           if ($LASTEXITCODE -eq 0 -and $existing) {
             $j = $existing | ConvertFrom-Json
-            if (-not $j.isDraft) {
-              Write-Host "::notice::Release $env:TAG 已存在且已公开，保持原样（不覆盖已发布版本）"
-              'url=' + $j.url | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-              exit 0
-            }
-            Write-Host '已存在草稿，更新说明后继续'
+            $existsFlag = if ($j.isDraft) { 'true' } else { 'false' }
+            $existingUrl = $j.url
+          }
+
+          $planJson = node .github/scripts/release-plan.cjs --mode $env:MODE --draft $env:DRAFT_INPUT --exists $existsFlag
+          if ($LASTEXITCODE -ne 0) { Write-Host '::error::发布决策脚本执行失败'; exit 1 }
+          $plan = $planJson | ConvertFrom-Json
+          Write-Host "发布动作：$($plan.action) —— $($plan.reason)"
+
+          if ($plan.action -eq 'keep-public') {
+            Write-Host "::notice::$($plan.reason)"
+            'url=' + $existingUrl | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+            exit 0
+          }
+
+          if ($plan.action -eq 'edit-draft' -or $plan.action -eq 'edit-and-publish') {
             gh release edit $env:TAG --repo $env:REPO --notes-file release-notes.md
             if ($LASTEXITCODE -ne 0) { Write-Host '::error::更新草稿说明失败'; exit 1 }
-            'url=' + $j.url | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+            if ($plan.action -eq 'edit-and-publish') {
+              # 关键一步：只改说明不等于发布。少了它，「先建草稿、确认后重跑」就永远公开不出去。
+              gh release edit $env:TAG --repo $env:REPO --draft=false
+              if ($LASTEXITCODE -ne 0) { Write-Host '::error::取消草稿失败'; exit 1 }
+            }
+            'url=' + $existingUrl | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
             exit 0
           }
 
@@ -311,7 +329,12 @@ jobs:
             '--notes-file', 'release-notes.md',
             '--target', $env:SHA
           )
-          if ($env:MODE -eq 'draft' -or $env:DRAFT_INPUT -eq 'true') { $params += '--draft' }
+          if ($plan.action -eq 'create-draft') {
+            $params += '--draft'
+            if ($env:MODE -eq 'publish') {
+              Write-Host '::warning::confirm=PUBLISH 但 draft=true，本次只创建草稿，不会公开'
+            }
+          }
           gh @params
           if ($LASTEXITCODE -ne 0) { Write-Host '::error::创建 Release 失败'; exit 1 }
           $url = gh release view $env:TAG --repo $env:REPO --json url --jq '.url'

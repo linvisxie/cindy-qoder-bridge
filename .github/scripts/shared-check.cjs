@@ -26,6 +26,7 @@ const SHARED_EXACT = [
   '.github/scripts/verify-package.cjs',
   '.github/scripts/release-notes.cjs',
   '.github/scripts/package-name.cjs',
+  '.github/scripts/release-plan.cjs',
   '.github/workflows/ci.yml',
   '.github/workflows/release.yml',
   'plugin/node/update.cjs',
