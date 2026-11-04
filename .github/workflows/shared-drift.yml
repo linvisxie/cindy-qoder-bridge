@@ -67,4 +67,8 @@ jobs:
       - name: 对比共享文件
         if: steps.twin.outputs.found == 'true'
         working-directory: repo
+        env:
+          # 两个仓库依次合并：先合并的一方必然暂时不一致，main 上只提示不判红。
+          # PR 上严格失败，用来拦住「改一处忘了改另一处」。
+          DRIFT_SOFT: ${{ github.event_name == 'push' && '1' || '0' }}
         run: node .github/scripts/shared-check.cjs --twin ../twin

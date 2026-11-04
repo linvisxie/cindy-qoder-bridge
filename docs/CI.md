@@ -137,7 +137,12 @@ node .github\scripts\ci-run.cjs --mode offline --only e2e-panel
 
 ### 改共享骨架要改两处
 
-`.github/scripts/` 与 `plugin/node/update.cjs`、`plugin/node/adapters.cjs` 在两个桥仓库里是**逐字相同的副本**（`adapters.cjs` 允许注释不同）。改了一个仓库，必须同步另一个，否则 `shared-drift.yml` 会红并指出具体行号。
+`.github/scripts/` 与 `plugin/node/update.cjs`、`plugin/node/adapters.cjs` 在两个桥仓库里是**逐字相同的副本**（`adapters.cjs` 允许注释不同）。改了一个仓库，必须同步另一个，否则 `shared-drift.yml` 会指出具体行号。
+
+注意它**在 PR 上严格失败、在 main 上只提示**：两个仓库是依次合并的，先合并的一方在另一仓跟上之前副本必然不一致，那段窗口是预期的。所以：
+
+- **PR 红** = 真的忘了同步，必须修
+- **main 上出现 warning** = 可能是"另一半还没合并"，等另一仓合并后手动重跑即可；不会把主分支长期判红
 
 ### 第三方 Action 一律钉提交 SHA
 

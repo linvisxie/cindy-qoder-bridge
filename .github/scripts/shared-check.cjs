@@ -12,6 +12,11 @@
 //   node .github/scripts/shared-check.cjs --twin <仓库根目录>
 //
 // 找不到另一个仓库时只打警告、不失败 —— 单独 clone 时不该红。
+//
+// --soft（或环境变量 DRIFT_SOFT=1）用于 push 到 main 的场景：
+// 两个仓库是「依次合并」的，先合并的那个仓库在另一个仓库跟上之前，副本必然不一致。
+// 那段窗口是预期的，不该把 main 判红并一直挂着（另一仓合并后本仓没有 push，不会自动重跑）。
+// 所以 main 上只报告、不失败；PR 上仍然严格失败，因为那正是「改一处忘了改另一处」的拦截点。
 'use strict';
 
 const { readFileSync, existsSync, readdirSync } = require('node:fs');
@@ -72,6 +77,8 @@ function firstDiffs(a, b) {
   return out;
 }
 
+const soft = process.argv.includes('--soft') || process.env.DRIFT_SOFT === '1';
+
 const twin = findTwin();
 if (!twin) {
   console.log('::warning::找不到同级仓库，跳过共享文件漂移检查（可用 --twin 指定路径）');
@@ -113,7 +120,15 @@ for (const rel of SHARED_CODE) {
 }
 
 if (problems.length) {
-  for (const p of problems) console.error('::error::共享文件漂移 - ' + p);
+  const note = soft
+    ? '::warning::共享文件漂移（main 分支仅提示，不判红） - '
+    : '::error::共享文件漂移 - ';
+  for (const p of problems) console.error(note + p);
+  if (soft) {
+    console.error('这些文件必须在两个仓库里保持同构：改一处就得改两处。');
+    console.error('当前在 main 上，只做提示：两个仓库可能是依次合并的，等另一仓跟上后即可恢复一致。');
+    process.exit(0);
+  }
   console.error('这些文件必须在两个仓库里保持同构：改一处就得改两处。');
   process.exit(1);
 }
