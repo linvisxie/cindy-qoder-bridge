@@ -173,7 +173,7 @@ function makeElement(id) {
   let failed = 0;
   for (const c of checks) {
     if (!c.pass) failed++;
-    console.log(`${c.pass ? 'PASS' : 'FAIL'}  ${c.name}${c.pass ? '' : '  got=' + JSON.stringify(c.got).slice(0, 160)}`);
+    console.log(`${c.pass ? 'PASS' : 'FAIL'}  ${c.name}${c.pass ? '' : '  got=' + String(JSON.stringify(c.got ?? null)).slice(0, 160)}`);
   }
   console.log(`\n${checks.length - failed}/${checks.length} 通过`);
   process.exit(failed === 0 ? 0 : 1);
