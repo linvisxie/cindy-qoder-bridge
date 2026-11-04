@@ -197,7 +197,7 @@ if (IS_TRAE) {
 // qoder 的额度走真实 fetch（openApiGet），所以注入全局 fetch 就能控制成败。
 {
   // 假响应必须和真实 Response 一样：text() 是**函数**，openApiGet 会 await 它。
-  const okBody = () => ({ ok: true, status: 200, text: async () => '{}', json: { qoderUsage: { userQuota: { total: 2000, used: 743 } } } });
+  const okBody = () => ({ ok: true, status: 200, text: async () => JSON.stringify({ qoderUsage: { userQuota: { total: 2000, used: 743 } } }) });
   const failRes = () => ({ ok: false, status: 500, text: async () => '', json: null });
 
   function quotaWorker(state) {
@@ -376,4 +376,53 @@ if (IS_TRAE) {
     assert.equal(adapters.anthropicUsage(noHit, 0).cache_read_input_tokens, 0);
   });
 
+}
+
+// Third review: malformed successful HTTP responses must preserve the last quota.
+for (const bad of ['not JSON', '{}', '{"code":"TOKEN_EXPIRED"}', '{"success":false}']) {
+  test(`invalid quota payload preserves old value: ${bad}`, async () => {
+    const w = worker();
+    w.run("refreshCredential=async()=>({token:'fixture'})");
+    const good = IS_TRAE ? {usage_summary:{total_amount:2000,consumed_amount:743}} : {userQuota:{total:2000,used:743}};
+    let body=JSON.stringify(good);
+    const fake=async()=>new Response(body,{status:200});
+    const original=global.fetch;
+    try {
+      if(IS_TRAE) global.fetch=fake; else w.ctx.fetch=fake;
+      await w.run('refreshUsage(true)'); assert.equal(w.run('lastQuota.total'),2000);assert.equal(w.run('lastQuota.used'),743);
+      w.run("setError('models','model failure')");
+      body=bad;await w.run('refreshUsage(true)');
+      assert.equal(w.run('lastQuota.total'),2000);assert.equal(w.run('lastQuota.used'),743);assert.equal(w.run('lastQuota.stale'),true);assert.ok(w.run('errors.usage'));
+      body=JSON.stringify(good);await w.run('refreshUsage(true)');
+      assert.equal(Boolean(w.run('lastQuota.stale')),false);assert.equal(Boolean(w.run('errors.usage')),false);assert.ok(w.run('errors.models'));
+    } finally {global.fetch=original;}
+  });
+}
+test('explicit zero quota remains a successful response',async()=>{
+ const w=worker();w.run("refreshCredential=async()=>({token:'fixture'})");const original=global.fetch;
+ const fake=async()=>new Response(JSON.stringify(IS_TRAE?{usage_summary:{total_amount:0,consumed_amount:0}}:{userQuota:{total:0,used:0}}));
+ try{if(IS_TRAE)global.fetch=fake;else w.ctx.fetch=fake;await w.run('refreshUsage(true)');assert.equal(w.run('lastQuota.total'),0);assert.equal(Boolean(w.run('errors.usage')),false);}finally{global.fetch=original;}
+});
+if(!IS_TRAE)test('invalid presentation falls back to a valid legacy quota',async()=>{
+ const w=worker();w.run("refreshCredential=async()=>({token:'fixture'})");let calls=0;
+ w.ctx.fetch=async()=>new Response(JSON.stringify(++calls===1?{code:'TOKEN_EXPIRED'}:{userQuota:{total:2000,used:800}}));
+ await w.run('refreshUsage(true)');assert.equal(calls,2);assert.equal(w.run('lastQuota.used'),800);assert.equal(w.run('lastUsage.source'),'quota/usage');
+});
+if(IS_TRAE){
+ for(const reason of ['no-auth-key','not-found'])test(`automatic credential refresh clears ${reason} without renewing`,async()=>{
+  let missing=false,calls=0;
+  const w=worker({trae:{readTraeCredential:()=>missing?{ok:false,reason}:{ok:true,credential:{token:'A',refreshToken:'R',expiresAtMs:Date.now()+3600000},identity:{}},refreshAccessToken:async()=>{calls++;throw Error('must not renew');}}});
+  await w.run('refreshCredential(true)');missing=true;w.run('credentialAt=0;credential.expiresAtMs=1');
+  assert.equal(await w.run('refreshCredential(false)'),undefined);assert.equal(calls,0);assert.equal(w.run('identity'),undefined);
+ });
+ test('automatic logout invalidates an in-flight renewal',async()=>{
+  let missing=false,finish;
+  const w=worker({trae:{readTraeCredential:()=>missing?{ok:false,reason:'no-auth-key'}:{ok:true,credential:{token:'A',refreshToken:'R',expiresAtMs:Date.now()+3600000},identity:{}},refreshAccessToken:()=>new Promise(r=>{finish=r})}});
+  await w.run('refreshCredential(true)');const pending=w.run("renewCredential('test')");missing=true;w.run('credentialAt=0');await w.run('refreshCredential(false)');finish({token:'late',expiresAtMs:Date.now()+3600000});assert.equal(await pending,false);assert.equal(w.run('credential'),undefined);
+ });
+ test('temporary read failure retains an unexpired credential',async()=>{
+  let broken=false;
+  const w=worker({trae:{readTraeCredential:()=>broken?{ok:false,reason:'decrypt-failed'}:{ok:true,credential:{token:'A',expiresAtMs:Date.now()+3600000},identity:{}}}});
+  await w.run('refreshCredential(true)');broken=true;w.run('credentialAt=0');assert.equal((await w.run('refreshCredential(false)')).token,'A');
+ });
 }
