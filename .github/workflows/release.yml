@@ -1,0 +1,395 @@
+name: Release
+
+# 正式发布。只能由维护者手动发起，普通 push 永远不会走到这里。
+#
+# 两种入口，效果不同：
+#   - Actions 页面 Run workflow  + confirm=PUBLISH  -> 按 inputs.draft 决定草稿 / 公开
+#   - 推一个 v* tag                                -> 只建草稿，不公开
+#
+# 幂等：同一个 tag 重跑不会覆盖已公开的 Release，也不会重复上传同内容资产；
+#       内容不同则直接失败（拒绝覆盖已发布版本）。
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '要发布的 tag，形如 v0.1.20，必须已存在且与 ghost.json 的 version 一致'
+        required: true
+        type: string
+      confirm:
+        description: '填 PUBLISH 才会真正创建 Release；留空或其它值只做演练'
+        required: true
+        default: 'DRY-RUN'
+        type: string
+      draft:
+        description: '建为草稿（不公开）'
+        required: true
+        default: true
+        type: boolean
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  NODE_VERSION: '22'
+
+jobs:
+  preflight:
+    name: 发布前置检查
+    runs-on: windows-latest
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      tag: ${{ steps.v.outputs.tag }}
+      sha: ${{ steps.v.outputs.sha }}
+      package: ${{ steps.v.outputs.package }}
+      mode: ${{ steps.mode.outputs.mode }}
+    steps:
+      - name: 检出（针对 tag 指向的确切提交）
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: 安装 Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: 判定发布模式
+        id: mode
+        shell: pwsh
+        env:
+          EVENT: ${{ github.event_name }}
+          CONFIRM: ${{ inputs.confirm }}
+        run: |
+          if ($env:EVENT -eq 'push') {
+            Write-Host '::notice::由 tag 推送触发，只创建草稿 Release，不公开'
+            'mode=draft' | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          } elseif ($env:CONFIRM -eq 'PUBLISH') {
+            'mode=publish' | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          } else {
+            Write-Host '::notice::confirm 不是 PUBLISH，本次只演练：跑测试、打包、校验，不创建 Release'
+            'mode=dry-run' | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          }
+
+      - name: 解析并校验 tag
+        id: v
+        shell: pwsh
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          $tag = $env:INPUT_TAG
+          if (-not $tag) { $tag = $env:REF_NAME }
+          if (-not $tag.StartsWith('v')) {
+            Write-Host "::error::tag 必须以 v 开头，实际是 $tag"
+            exit 1
+          }
+          git fetch --tags --force | Out-Null
+          node .github/scripts/check-version.cjs --tag $tag
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+          # tag 必须指向当前检出的提交，否则打出来的包和 tag 说的不是一个东西。
+          $head = (git rev-parse HEAD).Trim()
+          $tagSha = (git rev-list -n 1 $tag).Trim()
+          if ($head -ne $tagSha) {
+            Write-Host "::error::tag $tag 指向 $tagSha，但检出的提交是 $head"
+            exit 1
+          }
+
+          $pkg = node .github/scripts/package-name.cjs
+          $version = $tag.Substring(1)
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "sha=$head" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "package=$pkg" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Write-Host "版本 $version，tag $tag，提交 $head，产物 $pkg"
+
+  full-tests:
+    name: 发布前完整测试
+    needs: preflight
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - name: 检出
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.preflight.outputs.sha }}
+          persist-credentials: false
+
+      - name: 安装 Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: 清单校验
+        shell: pwsh
+        run: node plugin/scripts/verify-manifest.cjs
+
+      - name: 离线测试（全量）
+        shell: pwsh
+        run: node .github/scripts/ci-run.cjs --mode offline
+
+      - name: 保留测试报告
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-test-logs
+          path: |
+            artifacts/ci-logs/
+            artifacts/junit-offline.xml
+            artifacts/summary-offline.md
+          if-no-files-found: warn
+          retention-days: 30
+
+  build:
+    name: 构建并校验发布产物
+    needs: [preflight, full-tests]
+    runs-on: windows-latest
+    timeout-minutes: 20
+    outputs:
+      sha256: ${{ steps.hash.outputs.sha256 }}
+      size: ${{ steps.hash.outputs.size }}
+    steps:
+      - name: 检出
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.preflight.outputs.sha }}
+          persist-credentials: false
+
+      - name: 安装 Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: 打包
+        shell: pwsh
+        run: node plugin/scripts/pack.cjs
+
+      - name: 校验产物
+        shell: pwsh
+        env:
+          PKG: ${{ needs.preflight.outputs.package }}
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: node .github/scripts/verify-package.cjs --package "dist/$env:PKG" --expect-version $env:VERSION
+
+      - name: 可复现性：再打一次，两次 sha256 必须相同
+        shell: pwsh
+        env:
+          PKG: ${{ needs.preflight.outputs.package }}
+        run: |
+          $path = "dist/$env:PKG"
+          $first = (Get-FileHash $path -Algorithm SHA256).Hash.ToLower()
+          node plugin/scripts/pack.cjs | Out-Null
+          $second = (Get-FileHash $path -Algorithm SHA256).Hash.ToLower()
+          if ($first -ne $second) {
+            Write-Host "::error::两次打包结果不同：$first vs $second"
+            exit 1
+          }
+          Write-Host "两次打包 sha256 相同：$first"
+
+      - name: 记录摘要
+        id: hash
+        shell: pwsh
+        env:
+          PKG: ${{ needs.preflight.outputs.package }}
+        run: |
+          $path = "dist/$env:PKG"
+          $hash = (Get-FileHash $path -Algorithm SHA256).Hash.ToLower()
+          $size = (Get-Item $path).Length
+          "sha256=$hash" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "size=$size" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Value @(
+            '### 发布产物'
+            ''
+            "- 文件：$env:PKG"
+            "- 版本：${{ needs.preflight.outputs.version }}"
+            "- 提交：${{ needs.preflight.outputs.sha }}"
+            "- 大小：$size 字节"
+            "- sha256：$hash"
+          )
+
+      - name: 上传待发布产物
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-package
+          path: |
+            dist/*.cindy
+            artifacts/SHA256SUMS.txt
+            artifacts/package-verification.json
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    name: 创建 Release 并上传
+    needs: [preflight, build]
+    if: needs.preflight.outputs.mode != 'dry-run'
+    runs-on: windows-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    environment: release
+    steps:
+      - name: 检出
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.preflight.outputs.sha }}
+          persist-credentials: false
+
+      - name: 下载构建产物
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-package
+          path: release-assets
+
+      - name: 核对下载到的产物
+        shell: pwsh
+        env:
+          EXPECT: ${{ needs.build.outputs.sha256 }}
+          PKG: ${{ needs.preflight.outputs.package }}
+        run: |
+          $file = Get-ChildItem 'release-assets' -Recurse -Filter '*.cindy' | Select-Object -First 1
+          if (-not $file) { Write-Host '::error::没有下载到 .cindy 产物'; exit 1 }
+          $hash = (Get-FileHash $file.FullName -Algorithm SHA256).Hash.ToLower()
+          if ($hash -ne $env:EXPECT) {
+            Write-Host "::error::下载后的产物 sha256 变了：$hash != $env:EXPECT"
+            exit 1
+          }
+          Write-Host "产物校验通过：$($file.Name) $hash"
+          New-Item -ItemType Directory -Force -Path 'release-assets/final' | Out-Null
+          Copy-Item $file.FullName "release-assets/final/$env:PKG"
+          "$env:EXPECT  $env:PKG" | Out-File -FilePath 'release-assets/final/SHA256SUMS.txt' -Encoding utf8 -NoNewline
+
+      - name: 生成 Release 说明
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: node .github/scripts/release-notes.cjs --version $env:VERSION --output release-notes.md
+
+      - name: 创建或复用 Release
+        id: rel
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+          VERSION: ${{ needs.preflight.outputs.version }}
+          SHA: ${{ needs.preflight.outputs.sha }}
+          MODE: ${{ needs.preflight.outputs.mode }}
+          DRAFT_INPUT: ${{ inputs.draft }}
+          REPO: ${{ github.repository }}
+          REPO_NAME: ${{ github.event.repository.name }}
+        run: |
+          # 决策逻辑在 .github/scripts/release-plan.cjs（纯函数 + 自检），
+          # 这里只负责按它的结论执行，避免 YAML 内联判断与自检脱节。
+          $existing = gh release view $env:TAG --repo $env:REPO --json isDraft,url 2>$null
+          $existsFlag = 'undefined'
+          $existingUrl = ''
+          if ($LASTEXITCODE -eq 0 -and $existing) {
+            $j = $existing | ConvertFrom-Json
+            $existsFlag = if ($j.isDraft) { 'true' } else { 'false' }
+            $existingUrl = $j.url
+          }
+
+          $planJson = node .github/scripts/release-plan.cjs --mode $env:MODE --draft $env:DRAFT_INPUT --exists $existsFlag
+          if ($LASTEXITCODE -ne 0) { Write-Host '::error::发布决策脚本执行失败'; exit 1 }
+          $plan = $planJson | ConvertFrom-Json
+          Write-Host "发布动作：$($plan.action) —— $($plan.reason)"
+
+          if ($plan.action -eq 'keep-public') {
+            Write-Host "::notice::$($plan.reason)"
+            'url=' + $existingUrl | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+            exit 0
+          }
+
+          if ($plan.action -eq 'edit-draft' -or $plan.action -eq 'edit-and-publish') {
+            gh release edit $env:TAG --repo $env:REPO --notes-file release-notes.md
+            if ($LASTEXITCODE -ne 0) { Write-Host '::error::更新草稿说明失败'; exit 1 }
+            if ($plan.action -eq 'edit-and-publish') {
+              # 关键一步：只改说明不等于发布。少了它，「先建草稿、确认后重跑」就永远公开不出去。
+              gh release edit $env:TAG --repo $env:REPO --draft=false
+              if ($LASTEXITCODE -ne 0) { Write-Host '::error::取消草稿失败'; exit 1 }
+            }
+            'url=' + $existingUrl | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+            exit 0
+          }
+
+          $params = @(
+            'release', 'create', $env:TAG,
+            '--repo', $env:REPO,
+            '--title', "$env:REPO_NAME $env:VERSION",
+            '--notes-file', 'release-notes.md',
+            '--target', $env:SHA
+          )
+          if ($plan.action -eq 'create-draft') {
+            $params += '--draft'
+            if ($env:MODE -eq 'publish') {
+              Write-Host '::warning::confirm=PUBLISH 但 draft=true，本次只创建草稿，不会公开'
+            }
+          }
+          gh @params
+          if ($LASTEXITCODE -ne 0) { Write-Host '::error::创建 Release 失败'; exit 1 }
+          $url = gh release view $env:TAG --repo $env:REPO --json url --jq '.url'
+          'url=' + $url | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: 上传资产（已存在且一致则跳过）
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+          SHA256: ${{ needs.build.outputs.sha256 }}
+          PKG: ${{ needs.preflight.outputs.package }}
+          REPO: ${{ github.repository }}
+        run: |
+          $info = gh release view $env:TAG --repo $env:REPO --json assets | ConvertFrom-Json
+          $assets = @($info.assets)
+
+          $mine = @($assets | Where-Object { $_.name -eq $env:PKG })
+          if ($mine.Count -gt 0) {
+            # GitHub 的 asset.digest 形如 sha256:<hex>（2025 年起提供）。
+            if ($mine[0].digest -eq "sha256:$env:SHA256") {
+              Write-Host "::notice::$env:PKG 已存在且 digest 一致，跳过（不覆盖已发布资产）"
+            } else {
+              Write-Host "::error::$env:PKG 已存在但内容不同（远端 $($mine[0].digest)，本地 sha256:$env:SHA256）"
+              Write-Host '::error::拒绝覆盖已发布资产。请提升版本号后重新发布。'
+              exit 1
+            }
+          } else {
+            gh release upload $env:TAG "release-assets/final/$env:PKG" --repo $env:REPO
+            if ($LASTEXITCODE -ne 0) { Write-Host '::error::上传 .cindy 失败'; exit 1 }
+          }
+
+          if (@($assets | Where-Object { $_.name -eq 'SHA256SUMS.txt' }).Count -eq 0) {
+            gh release upload $env:TAG 'release-assets/final/SHA256SUMS.txt' --repo $env:REPO
+            if ($LASTEXITCODE -ne 0) { Write-Host '::error::上传 SHA256SUMS.txt 失败'; exit 1 }
+          } else {
+            Write-Host 'SHA256SUMS.txt 已存在，跳过'
+          }
+
+      - name: 输出发布结果
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+          REPO: ${{ github.repository }}
+        run: |
+          $j = gh release view $env:TAG --repo $env:REPO --json url,isDraft,assets | ConvertFrom-Json
+          $state = if ($j.isDraft) { '草稿（未公开）' } else { '已公开' }
+          $names = (@($j.assets) | ForEach-Object { $_.name }) -join ', '
+          Write-Host "Release：$($j.url)  $state"
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Value @(
+            '### 发布结果'
+            ''
+            "- Release：$($j.url)"
+            "- 状态：$state"
+            "- 资产：$names"
+            "- sha256：${{ needs.build.outputs.sha256 }}"
+          )

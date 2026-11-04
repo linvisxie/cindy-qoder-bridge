@@ -1,0 +1,74 @@
+name: 共享文件漂移
+
+# 两个桥（qoder / trae）共享同一套 CI 骨架与两个核心文件：
+#   .github/scripts/{ci-run,check-version,verify-package}.cjs
+#   plugin/node/update.cjs
+# 它们在两个仓库里是逐字相同的副本（没有 submodule、没有额外仓库）。
+# 这个工作流证明副本还一样 —— 不一样就红，指出具体哪几行不同。
+#
+# 仓库变量 TWIN_REPOSITORY 指定「另一个仓库」，例如 linvisxie/trae-cindy-bridge。
+# 两个仓库都是公开的，所以用匿名 clone 读取，不传任何 token。
+# 变量没设置时只提示、不失败 —— 单独 fork 时不冤枉人。
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/**'
+      - 'plugin/node/update.cjs'
+  pull_request:
+    paths:
+      - '.github/**'
+      - 'plugin/node/update.cjs'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: drift-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  drift:
+    name: 对比另一个仓库的副本
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: 检出
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: repo
+          persist-credentials: false
+
+      - name: 安装 Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+
+      - name: 匿名 clone 另一个仓库
+        id: twin
+        env:
+          TWIN: ${{ vars.TWIN_REPOSITORY }}
+        run: |
+          if [ -z "$TWIN" ]; then
+            echo '::notice::没有设置仓库变量 TWIN_REPOSITORY，跳过漂移检查'
+            echo 'found=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # 公开仓库，匿名 https 即可；不在这里放任何凭证。
+          if git clone --depth 1 "https://github.com/${TWIN}.git" twin; then
+            echo 'found=true' >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::clone 另一个仓库失败（$TWIN），跳过漂移检查"
+            echo 'found=false' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 对比共享文件
+        if: steps.twin.outputs.found == 'true'
+        working-directory: repo
+        env:
+          # 两个仓库依次合并：先合并的一方必然暂时不一致，main 上只提示不判红。
+          # PR 上严格失败，用来拦住「改一处忘了改另一处」。
+          DRIFT_SOFT: ${{ github.event_name == 'push' && '1' || '0' }}
+        run: node .github/scripts/shared-check.cjs --twin ../twin
