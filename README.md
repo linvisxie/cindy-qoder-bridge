@@ -104,6 +104,8 @@ npm run pack        :: 产出 dist\cindy-qoder-bridge.cindy
 
 `.cindy` 就是个 zip（`ghost.json` 在根部），`scripts/pack.cjs` 是零依赖的手写打包器，同样输入产出同样字节。
 
+> **从 0.1.20 起是字节级可复现的**：同一提交在任何时区（UTC / 北京时间）、任何换行状态（LF / CRLF 工作区）打出的 sha256 完全相同。可直接用 Release 上的 `SHA256SUMS.txt` 核对。
+
 ### 2. 装进 Cindy
 
 Cindy → 插件页 → 导入 `.cindy`（也可以直接把文件拖进去）。
@@ -184,7 +186,7 @@ AI 侧也能问：`qoder_status`、`qoder_endpoint`、`qoder_refresh`、`qoder_c
 
 ## 开发与测试
 
-`test/` 下每个脚本都是独立的、可复跑的判据。多数脚本**需要先装好并登录 Qoder CN**（要真读登录态、真打上游）；`host-guard`、`responses-status`、`e2e-package` 是纯本地的。没登录时 `features` 与 `e2e-panel` 会把依赖登录态的用例打 `--` / `SKIP` 跳过，不会崩，但那样等于没验到。
+`test/` 下每个脚本都是独立的、可复跑的判据。多数脚本**需要先装好并登录 Qoder CN**（要真读登录态、真打上游）；纯本地的有 `host-guard`、`responses-status`、`upstream-contract`、`update-chain`、`review-regressions`。没登录时 `features` 与 `e2e-panel` 会把依赖登录态的用例打 `--` / `SKIP` 跳过，不会崩，但那样等于没验到。
 
 ```bat
 cd plugin && npm run verify     :: 清单静态校验
@@ -193,7 +195,8 @@ cd plugin && npm run pack       :: 打包
 node test\host-guard.js         :: Host 守卫 13 项（纯本地，不需要登录）
 node test\responses-status.js   :: Responses 状态映射 19 项（纯本地，不需要登录）
 node test\upstream-contract.js  :: 上游契约 16 项（纯本地：交错工具分片 / 截断判定 / usage 回传）
-node test\update-chain.js       :: 自更新链路 50 项（纯本地：版本比较 / digest 校验 / 解包 / 脚本生成）
+node test\update-chain.js       :: 自更新链路 52 项（纯本地：版本比较 / digest fail-closed / 解包 / 回滚脚本生成）
+node test\review-regressions.js :: 历次复审行为回归 40 项（纯本地：额度容错 / 错误映射 / 打包身份校验）
 node test\e2e-package.js        :: 包端到端 25 项（解包 → 起 worker → 真对话 → 三条协议）
 node test\e2e-panel.js          :: 面板脚本 10 项
 node test\e2e-brain.js          :: 面板 ↔ 电子脑真实总线 13 项
@@ -241,6 +244,7 @@ node .github\scripts\ci-run.cjs --mode offline   :: 与 GitHub Actions 同一份
 - **上下文只能报一个数。** Cindy 的供应商模型只认单一数值，所以报了最大档 1M。
 - **额度重置时间拿不到。** Qoder 的 `/sash/api/v2/me/usage` 不返回这个字段（实测返回的键里没有），面板会显示「Qoder 接口没给」。
 - **依赖 Qoder 的内部接口。** 上游一改，插件就失效。这不是「长期稳定」的东西。
+- **省略 `stream` 时按流式返回**，与三份官方协议的默认值（非流式）相反。这是刻意的兼容取舍：Cindy 的 Anthropic 接入探测不传 `stream` 字段，且按 `text/event-stream` 解析响应；若改成官方语义，保存供应商的探测会直接判定「接入不兼容」。标准 SDK 想拿非流式响应，显式传 `stream: false` 即可。详见 issue #15。
 
 ## 免责声明
 
