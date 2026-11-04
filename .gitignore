@@ -32,3 +32,6 @@ Thumbs.db
 *.swp
 .vscode/
 .idea/
+
+# 临时中间文件
+*.tmp
