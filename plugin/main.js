@@ -8,6 +8,9 @@ const CHANNEL = 'qoder-bridge-panel';
 
 let lastStatus = null;
 const seen = new Set();
+// reqId → 已发出的结果：面板重发同一 reqId 时，若结果已经算好就直接重发，
+// 不再只丢弃——回执丢一次，面板就只能干等到超时误报失败（动作其实可能已成功）。
+const panelResults = new Map();
 
 /**
  * cindy.node.request 的返回值是**两层**的：
@@ -191,7 +194,14 @@ if (channel) {
   channel.onmessage = async (event) => {
     const data = event && event.data;
     if (!data || data.__panel !== true || typeof data.reqId !== 'string') return;
-    if (seen.has(data.reqId)) return;          // 面板会重发，按 reqId 去重
+    if (seen.has(data.reqId)) {
+      // 面板会重发，按 reqId 去重不重复执行；但已算好的结果要重发，
+      // 还在算的就等它算完自己发（不能因为回执丢了就让面板误报超时）。
+      if (panelResults.has(data.reqId)) {
+        try { channel.postMessage({ __brain: true, reqId: data.reqId, value: panelResults.get(data.reqId) }); } catch {}
+      }
+      return;
+    }
     seen.add(data.reqId);
     // 只淘汰最早的那条，别一次清空：清空后旧 reqId 再重发会被当成新请求，
     // 对签到这种有副作用的动作就是重复提交（靠上游幂等兜着，但没必要赌）。
@@ -199,9 +209,11 @@ if (channel) {
       const oldest = seen.values().next().value;
       if (oldest === undefined) break;
       seen.delete(oldest);
+      panelResults.delete(oldest);
     }
 
     const send = (value) => {
+      panelResults.set(data.reqId, value);
       try { channel.postMessage({ __brain: true, reqId: data.reqId, value }); } catch {}
     };
 

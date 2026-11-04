@@ -206,6 +206,18 @@ node test\features.js           :: 签到 / 用量 / 日志 / 倍率 / 错误码
 想换模型：`node test\smoke-protocols.js <模型 id>`（默认 `qfmodel`，免费）。
 每个测试自己开临时目录与独立端口，不会踩到正在跑的实例。
 
+### CI 跑哪些、哪些只能在本地跑
+
+云端跑的是上面那些**不需要登录态**的脚本：
+
+```bat
+node .github\scripts\ci-run.cjs --mode offline   :: 与 GitHub Actions 同一份编排器
+```
+
+`e2e-package`、`e2e-brain`、`smoke-protocols`、`smoke-tools`、`wire-quirks` 必须先登录 Qoder CN、并会真打上游，所以只在开发机上手动跑（`--mode live`），CI 里明确标成「未运行」而不是「通过」。
+
+工作流结构、发布步骤、失败排查见 [docs/CI.md](docs/CI.md)。
+
 **为什么这些测试长这样**：它们都在防具体的线上事故 —— `host-guard` 防 Cindy 的代理转发时把 Host 头改成不带端口（那会让 claude-code 引擎 403）；`wire-quirks` 防 Base URL 带 `/v1` 被叠成 `/v1/v1/messages`、以及上下文选 1M 时 Cindy 把模型 id 编成 `qfmodel[1m]`；`e2e-brain` 防 `cindy.node.request` 的双层信封只剥一层（那会让面板显示「未登录 / 0 个 / —」）；`responses-status` 防 Responses 被截断或内容策略掐断时顶层与子项状态各说各话，也钉死「子项 status 只能是 `in_progress` / `completed` / `incomplete`」——`failed` 只属于顶层 `Response`。
 
 ## 本地端点

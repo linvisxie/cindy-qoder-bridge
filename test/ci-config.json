@@ -1,0 +1,60 @@
+{
+  "$comment": "CI 测试分类。offline 在 GitHub 托管 Runner 上跑；live 需要本机已登录 Qoder CN 与真实上游，只在开发机手动跑。新增 test/*.js 必须在这里登记，否则 ci-run.cjs 直接报错。",
+  "offline": [
+    {
+      "script": "host-guard",
+      "timeout": 180
+    },
+    {
+      "script": "responses-status",
+      "timeout": 120
+    },
+    {
+      "script": "upstream-contract",
+      "timeout": 120
+    },
+    {
+      "script": "update-chain",
+      "timeout": 120
+    },
+    {
+      "script": "review-regressions",
+      "timeout": 120
+    },
+    {
+      "script": "features",
+      "timeout": 240
+    },
+    {
+      "script": "e2e-panel",
+      "timeout": 240
+    }
+  ],
+  "live": [
+    {
+      "script": "e2e-package",
+      "timeout": 300,
+      "why": "断言必须读到真实 Qoder 登录态，并真打一轮上游对话"
+    },
+    {
+      "script": "e2e-brain",
+      "timeout": 180,
+      "why": "要真实 worker 报出 signedIn 与模型目录"
+    },
+    {
+      "script": "smoke-protocols",
+      "timeout": 300,
+      "why": "真向上游要一次回复（三条协议）"
+    },
+    {
+      "script": "smoke-tools",
+      "timeout": 300,
+      "why": "真向上游要一次 tool call"
+    },
+    {
+      "script": "wire-quirks",
+      "timeout": 300,
+      "why": "要带鉴权打真实路由，未登录一律 401"
+    }
+  ]
+}

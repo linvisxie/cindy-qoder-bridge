@@ -42,9 +42,13 @@ function crc32(buf) {
   return (c ^ 0xffffffff) >>> 0;
 }
 
+// 时间戳必须用 UTC 分量编码，不能用本地时间。
+// 踩过的坑：固定时间戳 new Date('2026-10-29T00:00:00Z')，但 getHours() 取的是本地时区，
+// 于是同一个提交在北京打出来是 08:00、在 UTC 机器上是 00:00，两边 sha256 不同。
+// CI 的"再打一次对比"只在同一台机器上跑，发现不了这种漂移 —— 只有换机器才会露出来。
 function dosTime(d) {
-  const time = ((d.getHours() & 0x1f) << 11) | ((d.getMinutes() & 0x3f) << 5) | ((d.getSeconds() / 2) & 0x1f);
-  const date = (((d.getFullYear() - 1980) & 0x7f) << 9) | (((d.getMonth() + 1) & 0x0f) << 5) | (d.getDate() & 0x1f);
+  const time = ((d.getUTCHours() & 0x1f) << 11) | ((d.getUTCMinutes() & 0x3f) << 5) | ((d.getUTCSeconds() / 2) & 0x1f);
+  const date = (((d.getUTCFullYear() - 1980) & 0x7f) << 9) | (((d.getUTCMonth() + 1) & 0x0f) << 5) | (d.getUTCDate() & 0x1f);
   return { time, date };
 }
 
