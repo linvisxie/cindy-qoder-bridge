@@ -104,7 +104,9 @@ npm run pack        :: 产出 dist\cindy-qoder-bridge.cindy
 
 `.cindy` 就是个 zip（`ghost.json` 在根部），`scripts/pack.cjs` 是零依赖的手写打包器，同样输入产出同样字节。
 
-> **从 0.1.20 起是字节级可复现的**：同一提交在任何时区（UTC / 北京时间）、任何换行状态（LF / CRLF 工作区）打出的 sha256 完全相同。可直接用 Release 上的 `SHA256SUMS.txt` 核对。
+> **从 0.1.20 起，同一提交在任何时区（UTC / 北京时间）打出的 sha256 相同。** 前提是工作区文件是 LF —— `pack.cjs` 直接读工作区字节，不做换行归一化。
+>
+> `.gitattributes` 保证正常 `git checkout` 得到 LF，但**如果你用编辑器把某个源文件另存成了 CRLF，本地重打的哈希就会与 Release 不同**。这种情况不是发布包被篡改，只是你的工作区与发布时的字节不一样：`git checkout -- .` 恢复后重打即可对上。核对发布包完整性请直接用 Release 上的 `SHA256SUMS.txt`。
 
 ### 2. 装进 Cindy
 

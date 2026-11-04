@@ -117,9 +117,15 @@ npm run pack        :: produces dist\cindy-qoder-bridge.cindy
 A `.cindy` is just a zip (with `ghost.json` at the root). `scripts/pack.cjs` is a
 zero-dependency hand-rolled packer — same input, same bytes out.
 
-> **Byte-for-byte reproducible since 0.1.20**: the same commit produces an identical
-> sha256 in any timezone (UTC / UTC+8) and from any line-ending state (LF / CRLF worktree).
-> Verify against `SHA256SUMS.txt` on the release page.
+> **Since 0.1.20, the same commit produces an identical sha256 in any timezone (UTC / UTC+8).**
+> The one precondition is that worktree files use LF — `pack.cjs` reads worktree bytes directly
+> and does not normalize line endings.
+>
+> `.gitattributes` guarantees LF on a normal `git checkout`, but **if an editor saves a source
+> file with CRLF, a local rebuild will hash differently from the release.** That is not evidence
+> of a tampered package — it means your worktree bytes differ from the ones that were packaged.
+> Run `git checkout -- .` and rebuild to match. To verify a release package, use
+> `SHA256SUMS.txt` from the release page.
 
 ### 2. Install into Cindy
 
