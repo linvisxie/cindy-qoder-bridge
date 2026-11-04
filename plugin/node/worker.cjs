@@ -1763,7 +1763,7 @@ async function applyUpdateOnce() {
   // 先验再落盘：校验不过就一个字节都不写进安装目录，当前版本继续跑。
   const check = updater.verifyDigest(bytes, info.asset.digest, info.asset.size);
   if (!check.ok) throw new Error(check.reason);
-  if (check.skipped) log('发布记录没给 digest 也没给 size，跳过完整性校验');
+  // verifyDigest 现在 fail-closed：要么 ok，要么带 reason 拒绝，不存在 skipped 这第三条路。
 
   // A matching digest proves bytes, not plugin identity or runnable contents.
   updater.validatePackage(readZipEntries(bytes), {
