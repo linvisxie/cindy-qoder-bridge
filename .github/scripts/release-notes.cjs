@@ -34,17 +34,20 @@ if (ghost.version !== version) {
 }
 
 // 抓 ## <version> 到下一个 ## 之间的正文。
-const escaped = version.replace(/\./g, '\\.');
-const re = new RegExp('^## ' + escaped + '\\s*$', 'm');
-const m = re.exec(changelog);
-if (!m) {
+//
+// 不用「把版本号拼进正则」：版本号来自命令行与文件，拼进正则就要调用方正确转义，
+// 漏一个就是 ReDoS / 误匹配入口（CodeQL 会报 high）。改成按行定位 + 精确比较。
+const changelogLines = changelog.split(/\r?\n/);
+const headingIndex = changelogLines.findIndex((line) => line.trim() === '## ' + version);
+if (headingIndex < 0) {
   console.error('::error::CHANGELOG.md 里找不到 ## ' + version + ' 小节');
   process.exit(1);
 }
-const start = m.index + m[0].length;
-const rest = changelog.slice(start);
-const next = /^## /m.exec(rest);
-let body = (next ? rest.slice(0, next.index) : rest).trim().replace(/\\n?-{3,}\\s*$/, '').trim();
+let endIndex = changelogLines.length;
+for (let i = headingIndex + 1; i < changelogLines.length; i++) {
+  if (changelogLines[i].startsWith('## ')) { endIndex = i; break; }
+}
+let body = changelogLines.slice(headingIndex + 1, endIndex).join('\n').trim().replace(/\n?-{3,}\s*$/, '').trim();
 
 // 去掉正文开头的日期标题行（形如 **2026-11-04** · 标题），标题留着自用。
 let title = '';

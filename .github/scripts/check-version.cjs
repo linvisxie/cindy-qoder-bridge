@@ -37,9 +37,13 @@ require_(ghost.version === pkg.version,
   'ghost.json (' + ghost.version + ') 与 package.json (' + pkg.version + ') 版本不一致');
 
 // CHANGELOG 必须有当前版本的独立小节。发布说明从那里来，不能凭空生成。
-const escaped = ghost.version.replace(/\./g, '\\.');
-const heading = new RegExp('^## ' + escaped + '\\s*$', 'm');
-require_(heading.test(changelog), 'CHANGELOG.md 缺少 "## ' + ghost.version + '" 小节');
+//
+// 不用「把版本号拼进正则」的做法：版本号来自文件内容，拼进正则就要求调用方
+// 正确转义反斜杠与其它元字符，漏一个就是一个 ReDoS / 误匹配的入口（CodeQL 会报）。
+// 这里改成按行切分后精确比较，版本号只是字符串，不参与正则语法。
+const changelogLines = changelog.split(/\r?\n/);
+const headingIndex = changelogLines.findIndex((line) => line.trim() === '## ' + ghost.version);
+require_(headingIndex >= 0, 'CHANGELOG.md 缺少 "## ' + ghost.version + '" 小节');
 
 // 版本号只允许往上走：不许比最近发布的小。
 // 这里不查 GitHub，只查 CHANGELOG 里出现过的最高版本，离线也能用。

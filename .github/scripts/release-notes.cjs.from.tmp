@@ -1,0 +1,12 @@
+// 抓 ## <version> 到下一个 ## 之间的正文。
+const escaped = version.replace(/\./g, '\\.');
+const re = new RegExp('^## ' + escaped + '\\s*$', 'm');
+const m = re.exec(changelog);
+if (!m) {
+  console.error('::error::CHANGELOG.md 里找不到 ## ' + version + ' 小节');
+  process.exit(1);
+}
+const start = m.index + m[0].length;
+const rest = changelog.slice(start);
+const next = /^## /m.exec(rest);
+let body = (next ? rest.slice(0, next.index) : rest).trim().replace(/\n?-{3,}\s*$/, '').trim();
