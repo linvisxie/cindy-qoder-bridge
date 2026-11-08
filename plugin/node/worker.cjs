@@ -413,13 +413,16 @@ function loadState() {
 function saveState(patch) {
   try {
     mkdirSync(DATA_DIR, { recursive: true });
-    writeFileSync(STATE_FILE, JSON.stringify({ ...loadState(), ...patch }, null, 1));
+    writeJsonAtomic(STATE_FILE, { ...loadState(), ...patch });
   } catch (e) { log('state write failed', e.message); }
 }
 
+let credentialGeneration = 0;
 async function refreshCredential(force) {
   if (!force && credential && Date.now() - credentialAt < 5 * 60 * 1000) return credential;
+  const generation = ++credentialGeneration;
   const c = await loadCredential(region);
+  if (generation !== credentialGeneration) return credential;
   if (c) {
     credential = c;
     credentialAt = Date.now();
@@ -544,13 +547,27 @@ function pickNumber(...vals) {
   return undefined;
 }
 
+function validQuotaBucket(bucket) {
+  if (bucket === null) return true;
+  if (!bucket || typeof bucket !== 'object' || Array.isArray(bucket)) return false;
+  const totals = ['total', 'totalAmount', 'quota', 'amount'];
+  if (!totals.some(k => Object.hasOwn(bucket, k))) return false;
+  return [...totals, 'used', 'usedAmount', 'consumed', 'remaining', 'left', 'balance']
+    .filter(k => Object.hasOwn(bucket, k)).every(k => {
+      const v = bucket[k];
+      return (typeof v === 'number' || (typeof v === 'string' && v.trim() !== ''))
+        && Number.isFinite(Number(v)) && Number(v) >= 0;
+    });
+}
+
 // 额度桶：有的版本给 total/used/remaining，有的只给 total/used。
 function normalizeBucket(src) {
-  if (!src || typeof src !== 'object') return undefined;
+  if (!src || !validQuotaBucket(src)) return undefined;
   const total = pickNumber(src.total, src.totalAmount, src.quota, src.amount);
   if (!(total > 0)) return undefined;
-  const used = pickNumber(src.used, src.usedAmount, src.consumed) ?? 0;
-  const remaining = pickNumber(src.remaining, src.left, src.balance) ?? Math.max(0, total - used);
+  const knownRemaining = pickNumber(src.remaining, src.left, src.balance);
+  const used = pickNumber(src.used, src.usedAmount, src.consumed) ?? Math.max(0, total - (knownRemaining ?? total));
+  const remaining = knownRemaining ?? Math.max(0, total - used);
   return {
     total, used, remaining,
     percentage: Math.min(1, Math.max(0, used / total)),
@@ -566,13 +583,9 @@ function validUsageResponse(response) {
   if (root.success === false || root.error) return false;
   const key = ['userQuota', 'user_quota'].find(k => Object.hasOwn(root, k));
   if (!key) return false;
-  const bucket = root[key];
-  // Explicit null represents no quota; absent/unknown fields do not.
-  if (bucket === null) return true;
-  if (!bucket || typeof bucket !== 'object' || Array.isArray(bucket)) return false;
-  const total = bucket.total ?? bucket.totalAmount ?? bucket.quota ?? bucket.amount;
-  return (typeof total === 'number' || (typeof total === 'string' && total.trim() !== ''))
-    && Number.isFinite(Number(total)) && Number(total) >= 0;
+  // Explicit null represents no quota; malformed present numeric fields are errors.
+  return ['userQuota', 'user_quota', 'addOnQuota', 'add_on_quota', 'addonQuota']
+    .filter(k => Object.hasOwn(root, k)).every(k => validQuotaBucket(root[k]));
 }
 
 // 用量面板：先走 /sash/api/v2/me/usage（给会员到期日、附加包、展示模式），
@@ -790,11 +803,8 @@ function writeJsonAtomic(file, value) {
   writeFileSync(tmp, JSON.stringify(value, null, 1));
   try { renameSync(tmp, file); }
   catch (e) {
-    // Windows 上目标被别的进程短暂占住时 rename 会失败，退回直写再清临时文件
-    try { writeFileSync(file, JSON.stringify(value, null, 1)); } finally {
-      try { unlinkSync(tmp); } catch {}
-    }
-    if (e && e.code !== 'EPERM' && e.code !== 'EACCES' && e.code !== 'EBUSY') throw e;
+    try { unlinkSync(tmp); } catch {}
+    throw e;
   }
 }
 
@@ -1118,21 +1128,16 @@ function isLoopbackAddr(a) {
 // 只放行 loopback。以前是按字符串前缀判 `127.0.0.1:`（要求带冒号带端口），
 // 结果不带端口的 Host（部分 SDK / 代理会去掉默认端口）直接被 403 —— claude-code
 // 引擎走 Cindy 的 anthropic-compat-proxy 中转时就踩了这个坑。
-// 现在按 hostname 判，端口可有可无，[::1] 与 ::1 都认。
+// 校验完整 authority：端口可有可无，IPv6 必须带方括号。
 function hostOk(req) {
   const raw = String(req.headers.host || '').toLowerCase().trim();
   if (!raw) return isLoopbackAddr(req.socket && req.socket.remoteAddress);
-  let hostname = raw;
-  if (hostname.startsWith('[')) {
-    const end = hostname.indexOf(']');
-    hostname = end !== -1 ? hostname.slice(0, end + 1) : hostname;
-  } else {
-    const colon = hostname.lastIndexOf(':');
-    if (colon !== -1 && hostname.indexOf(':') === colon) hostname = hostname.slice(0, colon);
-  }
-  if (!hostname) return false;
-  if (hostname === 'localhost' || hostname === '[::1]' || hostname === '::1') return true;
-  return /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(hostname);
+  const match = /^(\[::1\]|localhost|127\.\d{1,3}\.\d{1,3}\.\d{1,3})(?::(\d+))?$/.exec(raw);
+  if (!match) return false;
+  if (match[2] !== undefined && !(Number(match[2]) >= 1 && Number(match[2]) <= 65535)) return false;
+  const hostname = match[1];
+  if (hostname === 'localhost' || hostname === '[::1]') return true;
+  return hostname.split('.').every(part => Number(part) <= 255);
 }
 
 function authOk(req) {
@@ -1210,7 +1215,7 @@ async function handle(req, res) {
   }
   if ((url === '/v1/messages/count_tokens' || url === '/v1/messages/count_tokens/') && req.method === 'POST') {
     if (!authOk(req)) { sendJson(res, 401, { error: { message: '本地 API Key 不对：面板上那串 Token 要一字不差地填进 Cindy 的 API Key 栏。' } }); return; }
-    const parsed = await readJsonBody(req, res);
+    const parsed = await readGenerationBody(req, res, 'anthropic');
     if (!parsed.ok) return;
     let chat;
     try {
@@ -1239,12 +1244,24 @@ function normalizeModelKey(id) {
   return /\[1m\]$/i.test(s) ? s.slice(0, -4) : s;
 }
 
-async function chatCompletions(req, res) {
+async function readGenerationBody(req, res, protocol) {
   const parsed = await readJsonBody(req, res);
+  if (!parsed.ok) return parsed;
+  const body = parsed.value;
+  let error;
+  if (!body || typeof body !== 'object' || Array.isArray(body)) error = '请求体必须是对象';
+  else if (protocol === 'responses') {
+    if (typeof body.input !== 'string' && !Array.isArray(body.input)) error = 'input 必须是字符串或数组';
+  } else if (!Array.isArray(body.messages) || !body.messages.length) error = 'messages 必须是非空数组';
+  if (!error) return parsed;
+  sendJson(res, 400, { error: { message: error, type: 'invalid_request_error' } });
+  return { ok: false };
+}
+
+async function chatCompletions(req, res) {
+  const parsed = await readGenerationBody(req, res, 'chat');
   if (!parsed.ok) return;
-  // body 可能是 JSON 标量（null、数字、字符串）：一律当空对象处理，
-  // 让后面的校验按 400 回，而不是在这里读 .model 抛 TypeError 变 500。
-  const payload = parsed.value && typeof parsed.value === 'object' ? parsed.value : {};
+  const payload = parsed.value;
 
   const displayModel = normalizeModelKey(payload.model);
   const entry = models.find((m) => m.key === displayModel);
@@ -1306,7 +1323,7 @@ async function chatCompletions(req, res) {
   }
 
   if (!wantStream) {
-    const content = []; const calls = new Map(); let finish = 'stop'; let usage;
+    const content = []; const reasoning = []; const calls = new Map(); let finish = 'stop'; let usage;
     try {
       for (let s = first; !s.done; s = await iterator.next()) {
       const c = s.value;
@@ -1315,6 +1332,8 @@ async function chatCompletions(req, res) {
       if (!ch) continue;
       const d = ch.delta || ch.message || {};
       if (typeof d.content === 'string') content.push(d.content);
+      const r = d.reasoning_content ?? d.reasoning;
+      if (typeof r === 'string') reasoning.push(r);
       if (Array.isArray(d.tool_calls)) for (const t of d.tool_calls) {
         const i = t.index ?? 0;
         const cur = calls.get(i) || { id: '', type: 'function', function: { name: '', arguments: '' } };
@@ -1335,6 +1354,7 @@ async function chatCompletions(req, res) {
       return;
     }
     const message = { role: 'assistant', content: content.join('') };
+    if (reasoning.length) message.reasoning_content = reasoning.join('');
     if (calls.size) message.tool_calls = [...calls.values()];
     cancelOnClose.done();
     recordUsage(entry || { model: displayModel }, 'chat', usage?.prompt_tokens, usage?.completion_tokens);
@@ -1425,7 +1445,7 @@ async function openUpstream(req, res, request, displayModel) {
 }
 
 async function anthropicMessages(req, res) {
-  const parsed = await readJsonBody(req, res);
+  const parsed = await readGenerationBody(req, res, 'anthropic');
   if (!parsed.ok) return;
 
   let chat;
@@ -1480,7 +1500,7 @@ async function anthropicMessages(req, res) {
 }
 
 async function openaiResponses(req, res) {
-  const parsed = await readJsonBody(req, res);
+  const parsed = await readGenerationBody(req, res, 'responses');
   if (!parsed.ok) return;
 
   let chat;
@@ -1562,8 +1582,21 @@ function portIsOurs(port) {
   });
 }
 
+let serverStarting;
 async function startServer() {
+  if (serverStarting) return serverStarting;
   if (server) return;
+  serverStarting = startServerOnce();
+  try { await serverStarting; }
+  catch (e) {
+    try { server?.close(); } catch {}
+    server = null;
+    actualPort = 0;
+    throw e;
+  } finally { serverStarting = null; }
+}
+
+async function startServerOnce() {
   server = http.createServer((req, res) => {
     handle(req, res).catch((e) => {
       log('handler error', e.message);
@@ -1608,7 +1641,6 @@ async function startServer() {
     // 一个端口都没抢到：必须把 server 放回 null，否则下一次 RPC 的 `if (!server) await boot()`
     // 看到的是这个已经废掉的 http.Server 实例，于是永远不再重试，进程变成僵尸
     // （RPC 还在答，但 actualPort 是 0，客户端一直连不上）。
-    server = null;
     throw new Error(`端口 ${PREFERRED_PORT}..${PREFERRED_PORT + 19} 都被占用`);
   }
   actualPort = bound;
@@ -1743,8 +1775,12 @@ async function applyUpdate() {
     return { applied: false, error: '更新已在进行中', message: '更新已在进行中，不用重复点，等它装完自动重启。' };
   }
   updateInFlight = true;
-  try { return await applyUpdateOnce(); }
-  finally { updateInFlight = false; }
+  let handedOff = false;
+  try {
+    const result = await applyUpdateOnce();
+    handedOff = result.applied === true;
+    return result;
+  } finally { if (!handedOff) updateInFlight = false; }
 }
 
 async function applyUpdateOnce() {

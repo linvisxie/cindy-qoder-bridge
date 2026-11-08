@@ -25,6 +25,8 @@ function worker(options = {}) {
   const ctx = vm.createContext({
     __dirname: path.dirname(file), Buffer, URL, TextDecoder, AbortController, AbortSignal,
     require(id) {
+      if (id === 'node:http' && options.http) return options.http;
+      if (id === 'node:fs' && options.fs) return { ...baseRequire(id), ...options.fs };
       if (id === './trae.cjs' && options.trae) return options.trae;
       if (id === 'node:child_process') return {
         ...baseRequire(id),
@@ -42,7 +44,7 @@ function worker(options = {}) {
       stderr: { write() {} }, platform: process.platform, arch: process.arch,
       pid: process.pid, execPath: process.execPath, exit() { throw new Error('test must not exit worker'); },
     },
-    setTimeout(fn, ms) { if (ms === 800) { exits.push(fn); return 0; } return setTimeout(fn, ms); },
+    setTimeout(fn, ms) { if (options.fastTimers && ms === 1000) { queueMicrotask(fn); return 0; } if (ms === 800) { exits.push(fn); return 0; } return setTimeout(fn, ms); },
     clearTimeout,
   });
   // Retain the real implementation, omit resident boot and stdio event registration.
@@ -50,10 +52,10 @@ function worker(options = {}) {
   return { ctx, dir, launches, exits, run: (source) => vm.runInContext(source, ctx) };
 }
 
-async function request(w, route, body) {
+async function request(w, route, body, auth = 'local-test') {
   const req = Readable.from([Buffer.from(JSON.stringify(body))]);
   req.method = 'POST'; req.url = route;
-  req.headers = { host: '127.0.0.1', authorization: 'Bearer local-test' };
+  req.headers = { host: '127.0.0.1', authorization: 'Bearer ' + auth };
   req.socket = { remoteAddress: '127.0.0.1' };
   const res = Object.assign(new EventEmitter(), {
     text: '', writeHead(status) { this.status = status; this.headersSent = true; },
@@ -133,13 +135,15 @@ for (const code of ['ENOENT', 'EACCES']) test(`installer ${code} leaves worker r
   const w = worker({ spawnError: Object.assign(new Error(code), { code }) }); prepareUpdate(w, entries());
   await assert.rejects(w.run('applyUpdate()'), new RegExp(code));
   assert.equal(w.launches.length, 1); assert.equal(w.exits.length, 0);
+  assert.equal(w.run('updateInFlight'), false);
   assert.deepEqual(fs.readdirSync(path.join(w.dir, 'update')), []);
 });
-test('successful spawn schedules exit only after start and uses fresh staging', async () => {
+test('successful spawn keeps update locked until worker exits', async () => {
   const w = worker(); prepareUpdate(w, entries());
   const first = await w.run('applyUpdate()'), second = await w.run('applyUpdate()');
-  assert.equal(first.applied, true); assert.equal(w.exits.length, 2);
-  assert.notEqual(first.scriptPath, second.scriptPath);
+  assert.equal(first.applied, true); assert.equal(second.applied, false);
+  assert.equal(w.exits.length, 1); assert.equal(w.launches.length, 1);
+  assert.equal(w.run('updateInFlight'), true);
 });
 test('release selection uses exact plugin package name', async () => {
   const w = worker();
@@ -426,3 +430,150 @@ if(IS_TRAE){
   await w.run('refreshCredential(true)');broken=true;w.run('credentialAt=0');assert.equal((await w.run('refreshCredential(false)')).token,'A');
  });
 }
+
+
+test('non-stream adapters retain actual usage when upstream throws after a frame', async () => {
+  const adapters = require('../plugin/node/adapters.cjs');
+  for (const aggregate of [adapters.anthropicMessage, adapters.responsesMessage]) {
+    const usage = { prompt_tokens: 123, completion_tokens: 45 };
+    const opts = {};
+    const iterator = { async next() { throw new Error('upstream failed'); } };
+    await assert.rejects(aggregate({ done: false, value: { usage } }, iterator, opts), /upstream failed/);
+    assert.deepEqual(opts.usage, usage);
+  }
+});
+
+
+test('rename failures preserve usage and state files without direct writes', () => {
+  for (const code of ['EIO', 'EPERM', 'EACCES', 'EBUSY']) {
+    const writes = [];
+    const w = worker({ fs: {
+      renameSync() { throw Object.assign(new Error(code), { code }); },
+      writeFileSync(file, ...args) { writes.push(file); return fs.writeFileSync(file, ...args); },
+    } });
+    for (const file of ['usage.json', 'state.json']) {
+      const target = path.join(w.dir, file);
+      fs.writeFileSync(target, '{"old":true}');
+      w.ctx.target = target;
+      assert.throws(() => w.run('writeJsonAtomic(target, {new:true})'), { code });
+      assert.equal(fs.readFileSync(target, 'utf8'), '{"old":true}');
+    }
+    w.run('saveState({token:"new"})');
+    assert.equal(fs.readFileSync(path.join(w.dir, 'state.json'), 'utf8'), '{"old":true}');
+    assert.ok(writes.every(file => file.endsWith('.tmp')));
+    assert.ok(!fs.readdirSync(w.dir).some(file => file.endsWith('.tmp')));
+  }
+});
+
+
+test('all listen failures clean server state and allow a fresh concurrent retry', async () => {
+  for (const code of ['EACCES', 'EADDRINUSE', 'SYNC']) {
+    let fail = true, created = 0, closed = 0;
+    const w = worker({ fastTimers: true, http: {
+      createServer() {
+        created++;
+        const server = new EventEmitter();
+        server.close = () => { closed++; };
+        server.listen = () => {
+          if (fail && code === 'SYNC') throw new Error('SYNC');
+          queueMicrotask(() => server.emit(fail ? 'error' : 'listening', Object.assign(new Error(code), { code })));
+        };
+        return server;
+      },
+    } });
+    w.run('portIsOurs=async()=>false');
+    await assert.rejects(w.run('startServer()'));
+    assert.equal(w.run('server'), null); assert.equal(w.run('actualPort'), 0);
+    assert.equal(closed, 1);
+    fail = false;
+    await Promise.all([w.run('startServer()'), w.run('startServer()')]);
+    assert.equal(created, 2); assert.ok(w.run('actualPort') > 0);
+  }
+});
+
+
+test('Chat non-stream aggregates reasoning aliases alongside answer content', async () => {
+  const w = worker();
+  w.run(`token='local-test';refreshCredential=async()=>({token:'fixture'});
+    streamChat=async function*(){
+      yield {choices:[{delta:{reasoning_content:'think '}}]};
+      yield {choices:[{delta:{reasoning:'more',content:'answer'},finish_reason:'stop'}]};
+    }`);
+  const res = await request(w, '/v1/chat/completions', { model:'test', messages:[{role:'user',content:'Hi'}], stream:false });
+  assert.equal(res.status, 200);
+  assert.deepEqual(JSON.parse(res.text).choices[0].message, {role:'assistant',content:'answer',reasoning_content:'think more'});
+});
+
+
+test('malformed quota numbers retain stale values while missing numbers are derived', async () => {
+  const w = worker();
+  w.run("refreshCredential=async()=>({token:'fixture'})");
+  let payload = {userQuota:{total:2000,used:743}};
+  w.ctx.fetch = async () => new Response(JSON.stringify(payload));
+  await w.run('refreshUsage(true)');
+  for (const field of ['total', 'totalAmount', 'quota', 'amount', 'used', 'usedAmount', 'consumed', 'remaining', 'left', 'balance']) {
+    for (const value of ['bad', '', null, true, -1, 'Infinity']) {
+      payload = {userQuota:{total:2000,[field]:value}};
+      await w.run('refreshUsage(true)');
+      assert.equal(w.run('lastQuota.used'), 743, field);
+      assert.equal(w.run('lastQuota.stale'), true, field);
+    }
+  }
+  payload = {userQuota:{total:2000,remaining:1257}};
+  await w.run('refreshUsage(true)');
+  assert.equal(w.run('lastQuota.used'),743); assert.equal(Boolean(w.run('lastQuota.stale')),false);
+  payload = {userQuota:{total:2000,used:743},addOnQuota:{total:100,remaining:'bad'}};
+  await w.run('refreshUsage(true)'); assert.equal(w.run('lastQuota.stale'),true);
+});
+
+
+test('late credential refresh cannot clear or overwrite a newer successful result', async () => {
+  for (const late of [undefined, {token:'old'}]) {
+    const w = worker();
+    w.run('globalThis.pending=[];loadCredential=()=>new Promise(resolve=>pending.push(resolve))');
+    const old = w.run('refreshCredential(true)');
+    const recent = w.run('refreshCredential(true)');
+    w.run("pending[1]({token:'new'})"); await recent;
+    const timestamp = w.run('credentialAt');
+    w.ctx.late = late;
+    w.run('pending[0](late)'); await old;
+    assert.equal(w.run('credential.token'), 'new');
+    assert.equal(w.run('credentialAt'), timestamp);
+  }
+});
+
+
+test('generation and token-count routes validate required input after auth before upstream', async () => {
+  const w = worker();
+  w.run(`token='local-test';globalThis.credentialCalls=0;globalThis.upstreamCalls=0;
+    refreshCredential=async()=>{credentialCalls++;return {token:'fixture'}};
+    streamChat=async function*(){upstreamCalls++;yield {choices:[{delta:{content:'ok'},finish_reason:'stop'}]}}`);
+  for (const route of ['/v1/chat/completions', '/v1/messages', '/v1/responses', '/v1/messages/count_tokens']) {
+    const responses = route.endsWith('responses');
+    const badFields = responses ? [{input:null},{input:1},{input:{}}] : [{messages:[]},{messages:null},{messages:'hi'}];
+    for (const body of [null, [], 1, 'hi', {}, ...badFields]) {
+      assert.equal((await request(w, route, body, 'wrong')).status, 401, route);
+      assert.equal((await request(w, route, body)).status, 400, route);
+    }
+  }
+  assert.equal(w.run('credentialCalls'),0); assert.equal(w.run('upstreamCalls'),0);
+  for (const [route, body] of [
+    ['/v1/chat/completions',{messages:[{role:'user',content:'hi'}]}],
+    ['/v1/messages',{messages:[{role:'user',content:[{type:'text',text:'hi'}]}]}],
+    ['/v1/messages/count_tokens',{messages:[{role:'user',content:'hi'}]}],
+    ['/v1/responses',{input:'hi'}],
+    ['/v1/responses',{input:[{type:'function_call_output',call_id:'call_a',output:'done'}]}],
+  ]) assert.equal((await request(w,route,{model:'test',stream:false,...body})).status,200,route);
+});
+
+test('Host authority rejects suffixes, invalid octets and invalid ports', () => {
+  const w = worker();
+  for (const host of ['127.0.0.1','127.0.0.2:1','127.255.255.255:65535','localhost','localhost:47821','[::1]','[::1]:47821']) {
+    w.ctx.host = host;
+    assert.equal(w.run("hostOk({headers:{host},socket:{remoteAddress:'127.0.0.1'}})"),true,host);
+  }
+  for (const host of ['::1','[::1].evil.com','[::1]:80.evil.com','[::1]:','[::1]:0','[::1]:65536','[::1]:bad','127.999.999.999','127.0.0.256','127.0.0.1:','127.0.0.1:-1','127.0.0.1:65536','localhost:bad']) {
+    w.ctx.host = host;
+    assert.equal(w.run("hostOk({headers:{host},socket:{remoteAddress:'127.0.0.1'}})"),false,host);
+  }
+});

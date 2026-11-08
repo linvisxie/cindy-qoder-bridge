@@ -292,7 +292,7 @@ async function anthropicMessage(first, iterator, opts) {
 
   for (let s = first; !s.done; s = await iterator.next()) {
     const c = s.value;
-    if (c && c.usage) usage = c.usage;
+    if (c && c.usage) { usage = c.usage; if (opts) opts.usage = usage; }
     const ch = c && c.choices && c.choices[0];
     if (!ch) continue;
     const d = ch.delta || ch.message || {};
@@ -654,7 +654,7 @@ async function responsesMessage(first, iterator, opts) {
 
   for (let s = first; !s.done; s = await iterator.next()) {
     const c = s.value;
-    if (c && c.usage) usage = c.usage;
+    if (c && c.usage) { usage = c.usage; if (opts) opts.usage = usage; }
     const ch = c && c.choices && c.choices[0];
     if (!ch) continue;
     const d = ch.delta || ch.message || {};

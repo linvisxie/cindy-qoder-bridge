@@ -138,6 +138,7 @@ const packagedByRepoPath = {
   'node/worker.cjs': 'plugin/node/worker.cjs',
   'node/adapters.cjs': 'plugin/node/adapters.cjs',
   'node/update.cjs': 'plugin/node/update.cjs',
+  'node/trae.cjs': 'plugin/node/trae.cjs',
   'LICENSE': 'LICENSE',
   'NOTICE': 'NOTICE',
   'THIRD-PARTY-NOTICES.md': 'THIRD-PARTY-NOTICES.md',
@@ -150,7 +151,7 @@ let drift = [];
 for (const e of entries) {
   const rel = e.name.replace(/\\/g, '/');
   const repoRel = packagedByRepoPath[rel];
-  if (!repoRel) continue;
+  if (!repoRel) { drift.push(rel + '（没有源码映射）'); continue; }
   const source = hasGit ? gitBlob(repoRel) : readFileSync(join(ROOT, repoRel));
   if (!source) { drift.push(rel + '（不在 HEAD 里）'); continue; }
   if (!source.equals(e.data)) {
