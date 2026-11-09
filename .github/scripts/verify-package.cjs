@@ -203,7 +203,12 @@ let bootDetail = '';
   try {
     unzip.extractZip(pkgPath, work);
     const entry = manifest.node && manifest.node.entry ? manifest.node.entry : 'node/worker.cjs';
-    const port = 47899;
+    // Let the OS pick an unused test port; never accidentally validate another
+    // repository's concurrently running worker on a shared fixed port.
+    const probe = require('node:net').createServer();
+    await new Promise((resolve, reject) => { probe.once('error', reject); probe.listen(0, '127.0.0.1', resolve); });
+    const port = probe.address().port;
+    await new Promise((resolve, reject) => probe.close(error => error ? reject(error) : resolve()));
     const dataDir = join(work, '_data');
     mkdirSync(dataDir, { recursive: true });
 
@@ -217,6 +222,9 @@ let bootDetail = '';
         CINDY_TRAE_PORT: String(port),
         APPDATA: dataDir,
         LOCALAPPDATA: dataDir,
+        USERPROFILE: dataDir,
+        HOME: dataDir,
+        XDG_CONFIG_HOME: dataDir,
       },
       stdio: ['ignore', 'pipe', 'pipe'],
       windowsHide: true,
@@ -228,10 +236,17 @@ let bootDetail = '';
     for (let i = 0; i < 60; i++) {
       await new Promise((r) => setTimeout(r, 500));
       try {
+        if (child.exitCode !== null) break;
+        const state = JSON.parse(readFileSync(join(dataDir, 'state.json'), 'utf8'));
+        if (state.port !== port || typeof state.token !== 'string' || !state.token) continue;
         const res = await fetch('http://127.0.0.1:' + port + '/healthz', { signal: AbortSignal.timeout(3000) });
         if (res.ok) {
           const j = await res.json();
-          bootOk = j && j.ok === true && typeof j.port === 'number';
+          const authenticated = await fetch('http://127.0.0.1:' + port + '/v1/models', {
+            headers: { Authorization: 'Bearer ' + state.token }, signal: AbortSignal.timeout(3000),
+          });
+          await authenticated.body?.cancel();
+          bootOk = authenticated.ok && j && j.ok === true && j.port === port;
           bootDetail = JSON.stringify(j);
           break;
         }
