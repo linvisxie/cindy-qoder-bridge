@@ -59,17 +59,19 @@ eq(r2.ok, false, 'digest 不一致时拒绝');
 truthy(/sha256 与发布记录不符/.test(r2.reason || ''), '拒绝理由说清了是哈希不符');
 truthy(/安装目录未改动/.test(r2.reason || ''), '拒绝理由承诺安装目录未改动');
 
-// 没有 digest 时退回按 size 校验
+// SHA256 必须存在，size 只能作为附加校验
 const r3 = updater.verifyDigest(bytes, undefined, bytes.length);
-eq(r3.ok, true, '无 digest 但 size 一致时通过');
+eq(r3.ok, false, '无 digest 即使 size 一致也拒绝');
 
 const r4 = updater.verifyDigest(bytes, undefined, bytes.length + 100);
 eq(r4.ok, false, '无 digest 但 size 不符时拒绝');
-truthy(/被截断/.test(r4.reason || ''), 'size 不符时提示可能被截断');
+truthy(/digest/.test(r4.reason || ''), '无 digest 时说明缺少必需的摘要');
 
 const r5 = updater.verifyDigest(bytes, undefined, undefined);
 eq(r5.ok, false, '两者都没有时拒绝（fail-closed，不零校验安装）');
-truthy(/无法校验/.test(r5.reason || ''), '双缺失拒绝理由说清是无法校验');
+truthy(/digest/.test(r5.reason || ''), '双缺失拒绝理由说明需要 digest');
+eq(updater.verifyDigest(bytes, 'sha256:' + goodHex, bytes.length + 1).ok, false, 'SHA256 一致但 size 不符仍拒绝');
+eq(updater.verifyDigest(bytes, 'sha256:ab', bytes.length).ok, false, 'SHA256 必须为 64 位');
 
 // digest 给了但格式坏了也不能静默降级成只看大小
 const r7 = updater.verifyDigest(bytes, 'sha256:ZZZ-not-hex!!', bytes.length);
@@ -157,6 +159,21 @@ try {
 }
 truthy(threw, '含 ../ 的条目被拒绝（zip slip 防护）');
 
+// Host trust is never package-owned: reject a matching path segment at any depth/case.
+const packageManifest = { id: 'test', schemaVersion: 3, version: '2.0.0', entry: 'main.js', node: { entry: 'node/worker.cjs' }, panel: { html: 'panel.html' } };
+const packageEntries = [
+  { name: 'ghost.json', data: Buffer.from(JSON.stringify(packageManifest)) },
+  ...['main.js', 'panel.js', 'panel.html', 'node/worker.cjs'].map(name => ({ name, data: Buffer.from('safe') })),
+];
+const expectedPackage = { id: 'test', version: '2.0.0', currentVersion: '1.0.0' };
+eq(updater.validatePackage(packageEntries, expectedPackage).id, 'test', '合法包仍可通过清单校验');
+for (const name of ['.cindy-trust.json', '.CINDY-TRUST.JSON', 'node/.CiNdY-TrUsT.JsOn', 'nested/.cindy-trust.json/child']) {
+  let rejected = false;
+  try { updater.validatePackage([...packageEntries, { name, data: Buffer.from('hostile') }], expectedPackage); }
+  catch (error) { rejected = /路径/.test(error.message); }
+  truthy(rejected, `拒绝宿主信任路径段：${name}`);
+}
+
 console.log('\n=== 第 4 组：PowerShell 脚本生成 ===');
 
 const sample = updater.buildApplyScript({
@@ -167,18 +184,37 @@ const sample = updater.buildApplyScript({
   syncScript: "C:\\some dir\\sync-snapshot.cjs",
   nodeExe: "C:\\Program Files\\nodejs\\node.exe",
   oldPid: 12345,
+  latestPointer: 'C:\\some dir\\bridge.updates\\latest-attempt.json',
+  installationPipe: '\\\\.\\pipe\\test-install',
+  ownershipPipe: '\\\\.\\pipe\\test-data',
 });
 
 truthy(sample.includes("$ErrorActionPreference = 'Stop'"), '脚本设置了 ErrorActionPreference=Stop');
-truthy(/Wait-Process -Id \$oldPid/.test(sample), 'Wait-Process 用的是 $oldPid 变量');
+truthy(/while \(Get-Process -Id \$oldPid/.test(sample), '轮询旧进程直到退出');
 truthy(sample.includes('$oldPid = 12345'), '脚本里 $oldPid 被赋成调用方的 pid');
-truthy(sample.includes("-Timeout 60"), '等待有 60 秒超时兜底');
-truthy(/Copy-Item \$root \$backup/.test(sample), '覆盖前会备份安装目录');
-truthy(sample.includes("Join-Path $stage '*'"), '会把暂存目录内容覆盖进安装目录');
-truthy(/\$sync/.test(sample) && /& \$nodeExe \$sync/.test(sample), '装完会调用快照同步脚本');
-truthy(sample.includes('finally'), '清理放在 finally 里（中途抛错也会清理）');
-truthy(/\$stage\) \{ Remove-Item \$stage/.test(sample), 'finally 里会删暂存目录');
-truthy(/\$pkg\) \{ Remove-Item \$pkg/.test(sample), 'finally 里会删下载下来的包');
+truthy(sample.includes('$timer.ElapsedMilliseconds -ge 60000'), '等待有 60 秒超时兜底');
+truthy(sample.indexOf('while (Get-Process') < sample.indexOf('Copy-Item -LiteralPath $root'), '等待退出后才备份');
+truthy(sample.includes('Copy-Item -LiteralPath $root -Destination $backup -Recurse -Force'), '覆盖前会备份安装目录');
+truthy(sample.includes('Copy-InstallFiles $stage $root') && sample.includes('Copy-Item -LiteralPath $_.FullName -Destination $destination -Force'), '按字面路径递归覆盖安装文件');
+truthy(sample.includes("Where-Object { $_.Name -ine '.cindy-trust.json' }") && sample.includes('Remove-InstallFiles $root') && sample.includes('Copy-InstallFiles $backup $root'), '复制和回滚逐层跳过宿主信任文件（不区分大小写）');
+truthy(!/\$sync|\$nodeExe|sync-snapshot|node\.exe|ghost-install-state/.test(sample), '兼容旧 opts 但不生成 Node 执行或宿主记录读写');
+truthy(sample.includes("hostReceipt = 'requires_host_install'") && sample.includes('Use Cindy native import to confirm the host installation record'), '结果明确要求原生导入确认宿主安装记录');
+truthy(sample.includes("if ($result.status -eq 'success')"), '只有成功才清理');
+truthy(sample.includes('foreach ($path in @($stage, $pkg))'), '清理仅包含暂存目录和下载包，不含备份或旧 sync 路径');
+truthy(sample.includes('Remove-Item -LiteralPath $PSCommandPath -Force'), '成功时删除安装脚本自身');
+truthy(sample.includes("$result.phase = 'rolling_back'; Save-Result"), '回滚前持久化阶段');
+truthy(sample.includes("$result.status = 'rollback_failed'; $result.rollbackError"), '回滚失败保留独立诊断');
+const installAcquire = sample.indexOf('$installationLock = [BridgeInstallOwnership]::CreateNamedPipeW');
+const dataAcquire = sample.indexOf('$lock = [BridgeInstallOwnership]::CreateNamedPipeW');
+truthy(sample.indexOf('while (Get-Process') < installAcquire && installAcquire < dataAcquire && dataAcquire < sample.indexOf("$result.phase = 'backup'"), '旧进程完全退出后按 install → data 取得两锁，之后才能备份');
+const fence = sample.indexOf('$latest = [IO.File]::ReadAllText($latestPointer)');
+truthy(dataAcquire < fence && fence < sample.indexOf("$result.phase = 'backup'"), '持有双 pipe 后、备份前读取 latest attempt 指针');
+truthy(sample.includes('[string]::IsNullOrWhiteSpace($latestPointer)') && sample.includes('latestPointer is required'), '生产双 pipe 必须提供 latestPointer');
+truthy(sample.includes('$latest.attempt -isnot [string]') && sample.includes('[StringComparison]::Ordinal') && sample.includes('(Split-Path -Leaf $attempt)'), '指针必须是字符串并与 attempt 叶名精确匹配');
+truthy(sample.includes('latest pointer missing or invalid; refusing installation'), '指针缺失或坏 JSON 时 fail closed');
+truthy(sample.includes('if ($installationLock.IsInvalid)') && sample.includes('if ($lock.IsInvalid)'), '任一 pipe 不可用都拒绝安装');
+truthy(sample.includes('if (!!$installationPipe -ne !!$ownershipPipe)') && sample.includes('if (!$installationPipe -and !$ownershipPipe)'), '只允许完整双 pipe 或纯旧文件锁，不能降级绕过');
+truthy(sample.lastIndexOf('Save-Result') < sample.indexOf('$lock.Dispose()') && sample.indexOf('$lock.Dispose()') < sample.indexOf('$installationLock.Dispose()'), '持锁至结果写入和清理完成，finally 按 data → install 释放');
 
 // 单引号转义：路径里带 ' 也不能让脚本被截断
 const tricky = updater.buildApplyScript({
@@ -187,28 +223,6 @@ const tricky = updater.buildApplyScript({
 });
 truthy(tricky.includes("'C:\\it''s a dir\\bridge'"), "路径里的单引号被正确转义成 ''");
 
-// 同步脚本：owner 目录从安装位置反推，不写死本机路径
-const sync = updater.buildSnapshotSyncScript({
-  installDir: 'C:\\Users\\x\\AppData\\Roaming\\CindyGlobal\\owners\\abc\\cindy-brain\\_ns\\_root\\qoder-bridge',
-  pkgPath: 'C:\\Users\\x\\AppData\\Roaming\\CindyGlobal\\qoder-bridge\\update\\pkg.cindy',
-});
-truthy(sync.includes('plugin-instances.v2.json'), '同步脚本会更新 plugin-instances.v2.json');
-truthy(sync.includes("'..', '..', '..', '..'"), 'owner 目录从安装位置反推');
-truthy(!/[A-Za-z]:\\\\Users\\\\linvisxie/.test(sync.replace(/\\\\/g, '\\')), '同步脚本里没有写死本机路径');
-truthy(sync.includes('packageSha256'), '同步脚本会写 packageSha256');
-truthy(sync.includes('receiptRevision'), '同步脚本会写 receiptRevision');
-truthy(sync.includes('_ns') && sync.includes('.json'), '同步脚本会更新清单快照');
-// 生成的脚本里应当是字面量 \n（反斜杠 + n 两个字符），不是真换行。
-// 用 fromCharCode 拼，避免多层转义数错。
-const EXPECTED_NL_ESCAPE = "+ '" + String.fromCharCode(92) + "n'";
-truthy(sync.includes(EXPECTED_NL_ESCAPE), '写 JSON 时补了结尾换行');
-// 生成的脚本自身必须是合法 JS
-try {
-  new Function(sync.replace(/^\s*'use strict';/m, ''));
-  ok('生成的同步脚本能被解析（语法合法）');
-} catch (e) {
-  bad('生成的同步脚本语法非法：' + e.message);
-}
 
 console.log('\n=== 第 5 组：两份 update.cjs 必须一致 ===');
 

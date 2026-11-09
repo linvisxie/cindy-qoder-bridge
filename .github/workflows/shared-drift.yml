@@ -15,11 +15,11 @@ on:
     branches: [main]
     paths:
       - '.github/**'
-      - 'plugin/node/update.cjs'
+      - 'plugin/node/*.cjs'
   pull_request:
     paths:
       - '.github/**'
-      - 'plugin/node/update.cjs'
+      - 'plugin/node/*.cjs'
   workflow_dispatch:
 
 permissions:
@@ -50,14 +50,21 @@ jobs:
         id: twin
         env:
           TWIN: ${{ vars.TWIN_REPOSITORY }}
+          TWIN_REF: ${{ github.head_ref }}
         run: |
           if [ -z "$TWIN" ]; then
             echo '::notice::没有设置仓库变量 TWIN_REPOSITORY，跳过漂移检查'
             echo 'found=false' >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          # PR 中优先比较姊妹仓同名分支，允许双仓共享改动在合并前共同验收。
+          # 无对应分支时仍严格比较默认分支；main push 始终检查对方默认分支。
+          args=()
+          if [ -n "$TWIN_REF" ] && git ls-remote --exit-code --heads "https://github.com/${TWIN}.git" "refs/heads/$TWIN_REF" > /dev/null; then
+            args=(--branch "$TWIN_REF")
+          fi
           # 公开仓库，匿名 https 即可；不在这里放任何凭证。
-          if git clone --depth 1 "https://github.com/${TWIN}.git" twin; then
+          if git clone --depth 1 "${args[@]}" "https://github.com/${TWIN}.git" twin; then
             echo 'found=true' >> "$GITHUB_OUTPUT"
           else
             echo "::warning::clone 另一个仓库失败（$TWIN），跳过漂移检查"

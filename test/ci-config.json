@@ -1,6 +1,13 @@
 {
   "$comment": "CI 测试分类。offline 在 GitHub 托管 Runner 上跑；live 需要本机已登录 Qoder CN 与真实上游，只在开发机手动跑。新增 test/*.js 必须在这里登记，否则 ci-run.cjs 直接报错。",
   "offline": [
+    { "script": "bootstrap", "timeout": 180 },
+    { "script": "protocol-defaults-reasoning", "timeout": 120 },
+    { "script": "ownership", "timeout": 180 },
+    { "script": "credential-reading", "timeout": 120 },
+    { "script": "update-download", "timeout": 120 },
+    { "script": "update-install-results", "timeout": 240 },
+    { "script": "update-status", "timeout": 120 },
     {
       "script": "host-guard",
       "timeout": 180

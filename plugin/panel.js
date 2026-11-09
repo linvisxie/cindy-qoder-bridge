@@ -87,6 +87,10 @@
       $('quota').textContent = ((q && q.note) ? q.note : '—') + stale;
     }
 
+    if (st.updateResult?.message && !$('checkUpdate').disabled) {
+      $('updateMsg').hidden = false;
+      $('updateMsg').textContent = st.updateResult.message;
+    }
     if (st.lastError) { $('err').hidden = false; $('err').textContent = st.lastError; }
     else $('err').hidden = true;
 

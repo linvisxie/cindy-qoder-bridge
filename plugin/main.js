@@ -114,6 +114,7 @@ cindy.onHostMessage(async function (msg) {
         lines.push('Qoder 桥：未登录。');
         lines.push(st.hint || hintFor(st));
       }
+      if (st.updateResult?.message) lines.push(`更新结果：${st.updateResult.message}`);
       ok({ text: lines.join('\n') });
       return;
     }

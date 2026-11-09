@@ -12,7 +12,7 @@ const os = require('node:os');
 const path = require('node:path');
 
 const PORT = Number(process.env.FEATURES_PORT || 47981);
-const WORKER = path.join(__dirname, '..', 'plugin', 'node', 'worker.cjs');
+const WORKER = path.join(__dirname, '..', 'plugin', 'node', 'bootstrap.cjs');
 
 let pass = 0;
 let fail = 0;
@@ -205,7 +205,7 @@ function readState(dataDir) {
   }
 
   // 上游错误帧的人工化映射：直接按 worker 的映射表校对（同一份规则文件里）
-  const src = fs.readFileSync(WORKER, 'utf8');
+  const src = fs.readFileSync(path.join(__dirname, '..', 'plugin', 'node', 'worker.cjs'), 'utf8');
   ok('映射表覆盖登录失效', /Qoder 登录失效了/.test(src));
   ok('映射表覆盖每日账单上限', /每日账单上限|账单上限/.test(src));
   ok('映射表覆盖排队', /排队/.test(src));

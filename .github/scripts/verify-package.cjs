@@ -7,7 +7,7 @@
 
 const { readFileSync, writeFileSync, mkdirSync, existsSync, readdirSync } = require('node:fs');
 const { join, resolve, basename } = require('node:path');
-const { createHash } = require('node:crypto');
+const { createHash, randomBytes } = require('node:crypto');
 
 const ROOT = resolve(__dirname, '..', '..');
 const ARTIFACTS = join(ROOT, 'artifacts');
@@ -135,9 +135,14 @@ const packagedByRepoPath = {
   'main.js': 'plugin/main.js',
   'panel.html': 'plugin/panel.html',
   'panel.js': 'plugin/panel.js',
+  'node/bootstrap.cjs': 'plugin/node/bootstrap.cjs',
   'node/worker.cjs': 'plugin/node/worker.cjs',
   'node/adapters.cjs': 'plugin/node/adapters.cjs',
   'node/update.cjs': 'plugin/node/update.cjs',
+  'node/ownership.cjs': 'plugin/node/ownership.cjs',
+  'node/download.cjs': 'plugin/node/download.cjs',
+  'node/update-status.cjs': 'plugin/node/update-status.cjs',
+  'node/trae.cjs': 'plugin/node/trae.cjs',
   'LICENSE': 'LICENSE',
   'NOTICE': 'NOTICE',
   'THIRD-PARTY-NOTICES.md': 'THIRD-PARTY-NOTICES.md',
@@ -150,7 +155,7 @@ let drift = [];
 for (const e of entries) {
   const rel = e.name.replace(/\\/g, '/');
   const repoRel = packagedByRepoPath[rel];
-  if (!repoRel) continue;
+  if (!repoRel) { drift.push(rel + '（没有源码映射）'); continue; }
   const source = hasGit ? gitBlob(repoRel) : readFileSync(join(ROOT, repoRel));
   if (!source) { drift.push(rel + '（不在 HEAD 里）'); continue; }
   if (!source.equals(e.data)) {
@@ -198,9 +203,18 @@ let bootDetail = '';
   try {
     unzip.extractZip(pkgPath, work);
     const entry = manifest.node && manifest.node.entry ? manifest.node.entry : 'node/worker.cjs';
-    const port = 47899;
+    // Let the OS pick an unused test port; never accidentally validate another
+    // repository's concurrently running worker on a shared fixed port.
+    const probe = require('node:net').createServer();
+    await new Promise((resolve, reject) => { probe.once('error', reject); probe.listen(0, '127.0.0.1', resolve); });
+    const port = probe.address().port;
+    await new Promise((resolve, reject) => probe.close(error => error ? reject(error) : resolve()));
     const dataDir = join(work, '_data');
     mkdirSync(dataDir, { recursive: true });
+    // Generate the local probe secret here, rather than reading file data into
+    // an outbound request. Only this candidate worker receives the seeded key.
+    const probeToken = randomBytes(32).toString('hex');
+    writeFileSync(join(dataDir, 'state.json'), JSON.stringify({ token: probeToken }));
 
     child = spawn(process.execPath, [join(work, entry)], {
       cwd: work,
@@ -212,6 +226,9 @@ let bootDetail = '';
         CINDY_TRAE_PORT: String(port),
         APPDATA: dataDir,
         LOCALAPPDATA: dataDir,
+        USERPROFILE: dataDir,
+        HOME: dataDir,
+        XDG_CONFIG_HOME: dataDir,
       },
       stdio: ['ignore', 'pipe', 'pipe'],
       windowsHide: true,
@@ -223,10 +240,15 @@ let bootDetail = '';
     for (let i = 0; i < 60; i++) {
       await new Promise((r) => setTimeout(r, 500));
       try {
+        if (child.exitCode !== null) break;
         const res = await fetch('http://127.0.0.1:' + port + '/healthz', { signal: AbortSignal.timeout(3000) });
         if (res.ok) {
           const j = await res.json();
-          bootOk = j && j.ok === true && typeof j.port === 'number';
+          const authenticated = await fetch('http://127.0.0.1:' + port + '/v1/models', {
+            headers: { Authorization: 'Bearer ' + probeToken }, signal: AbortSignal.timeout(3000),
+          });
+          await authenticated.body?.cancel();
+          bootOk = authenticated.ok && j && j.ok === true && j.port === port;
           bootDetail = JSON.stringify(j);
           break;
         }

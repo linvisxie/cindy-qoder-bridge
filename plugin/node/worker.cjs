@@ -3,6 +3,11 @@
 // stdout 只能写协议消息，日志一律写 stderr。
 'use strict';
 
+const bootstrapOwners = globalThis.__CINDY_BRIDGE_OWNERSHIP;
+if (!bootstrapOwners?.installation?.held || !bootstrapOwners?.data?.held) {
+  throw new Error('必须通过 node/bootstrap.cjs 取得安装目录和数据目录独占权后启动。');
+}
+
 const crypto = require('node:crypto');
 const http = require('node:http');
 const os = require('node:os');
@@ -15,6 +20,9 @@ const { execFile } = require('node:child_process');
 const { spawn } = require('node:child_process');
 const adapters = require('./adapters.cjs');
 const updater = require('./update.cjs');
+const { pipeName } = require('./ownership.cjs');
+const download = require('./download.cjs');
+const updateStatus = require('./update-status.cjs');
 
 // ============================================================
 // 协议层（移植自 @eghrhegpe/dsh-connect-qoder 0.7.6，MIT）
@@ -217,19 +225,22 @@ function machineIdFor(appDir) {
   return 'cindy-qoder-bridge';
 }
 
-function loadNewCredential(region, appDir, key) {
-  const file = join(appDir, 'auth.v1.dat');
-  if (!existsSync(file)) return undefined;
-  const plain = decryptOscrypt(readFileSync(file), key);
-  if (plain === undefined) return undefined;
+function loadNewCredential(region, appDir, key, blob) {
+  try { blob ??= readFileSync(join(appDir, 'auth.v1.dat')); }
+  catch (error) { return { status: error.code === 'ENOENT' ? 'absent' : 'temporary' }; }
+  const plain = decryptOscrypt(blob, key);
+  if (plain === undefined) return { status: 'temporary' };
   let s;
-  try { s = JSON.parse(plain); } catch { return undefined; }
-  if (!s || typeof s !== 'object') return undefined;
-  if (typeof s.token !== 'string' || s.token.length === 0) return undefined;
+  try { s = JSON.parse(plain); } catch { return { status: 'temporary' }; }
+  // Only a successfully decrypted explicit empty token is logout evidence.
+  // Missing fields / wrong shapes may be a partially-written or newer schema.
+  if (s === null || (s && typeof s === 'object' && Object.hasOwn(s, 'token') && (s.token === '' || s.token === null))) return { status: 'logged-out' };
+  if (!s || typeof s !== 'object' || Array.isArray(s)) return { status: 'temporary' };
+  if (typeof s.token !== 'string' || s.token.length === 0) return { status: 'temporary' };
   const u = s.user && typeof s.user === 'object' ? s.user : {};
-  if (typeof u.id !== 'string' || u.id.length === 0) return undefined;
+  if (typeof u.id !== 'string' || u.id.length === 0) return { status: 'temporary' };
   const exp = Date.parse(String(s.expiresAt));
-  return {
+  return { status: 'valid', credential: {
     region: region.id,
     userID: u.id,
     name: typeof u.name === 'string' ? u.name : '',
@@ -238,20 +249,29 @@ function loadNewCredential(region, appDir, key) {
     expiresAt: Number.isFinite(exp) ? exp : 0,
     expired: Number.isFinite(exp) && exp > 0 ? exp <= Date.now() : false,
     machineID: machineIdFor(appDir),
-  };
+  } };
 }
 
 async function loadCredential(region) {
   const root = appDataRoot();
+  let temporary = false;
+  let loggedOut = false;
   for (const appName of region.appNames) {
     const appDir = join(root, appName);
-    if (!existsSync(appDir)) continue;
-    const key = await oscryptKeyFor(appDir);
-    if (key === undefined) continue;
-    const cred = loadNewCredential(region, appDir, key);
-    if (cred !== undefined) return cred;
+    let blob;
+    try { blob = readFileSync(join(appDir, 'auth.v1.dat')); }
+    catch (error) { if (error.code !== 'ENOENT') temporary = true; continue; }
+    try {
+      // Absent auth is definitive even without Local State / a DPAPI key.
+      const key = await oscryptKeyFor(appDir);
+      if (key === undefined) { temporary = true; continue; }
+      const result = loadNewCredential(region, appDir, key, blob);
+      if (result.status === 'valid') return result;
+      if (result.status === 'temporary') temporary = true;
+      if (result.status === 'logged-out') loggedOut = true;
+    } catch { temporary = true; }
   }
-  return undefined;
+  return { status: temporary ? 'temporary' : loggedOut ? 'logged-out' : 'absent' };
 }
 
 function modelListUrl(region) { return `${region.baseUrl}algo/api/v2/model/list?Encode=1`; }
@@ -346,6 +366,15 @@ function toQoderTools(tools) {
 const DATA_DIR = process.env.CINDY_QODER_DATA || join(os.homedir(), 'AppData', 'Roaming', 'CindyGlobal', 'qoder-bridge');
 const PREFERRED_PORT = Number(process.env.CINDY_QODER_PORT || 47821);
 const STATE_FILE = join(DATA_DIR, 'state.json');
+const dataOwnership = bootstrapOwners.data;
+async function ensureOwnership() {
+  assertOwnership();
+  return dataOwnership;
+}
+function assertOwnership() {
+  bootstrapOwners.installation.assertHeld();
+  dataOwnership.assertHeld();
+}
 
 let region = REGIONS[0];
 let credential;
@@ -387,6 +416,7 @@ const MAX_BODY_BYTES = 20 * 1024 * 1024;
 // Cindy 只把 node worker 的 stderr 挂到自己那儿，重启就没了。这里同时落一份盘，
 // 出问题能翻历史；超过 2MB 就轮转成 bridge.log.1，不会无限长。
 function writeLogFile(line) {
+  if (!dataOwnership?.held) return; // Contenders log only to stderr.
   try {
     mkdirSync(DATA_DIR, { recursive: true });
     try {
@@ -411,25 +441,35 @@ function loadState() {
 }
 
 function saveState(patch) {
+  assertOwnership();
   try {
     mkdirSync(DATA_DIR, { recursive: true });
-    writeFileSync(STATE_FILE, JSON.stringify({ ...loadState(), ...patch }, null, 1));
+    writeJsonAtomic(STATE_FILE, { ...loadState(), ...patch });
   } catch (e) { log('state write failed', e.message); }
 }
 
+let credentialGeneration = 0;
+function currentCredential() {
+  if (credential) credential.expired = Number.isFinite(credential.expiresAt) && credential.expiresAt > 0
+    ? credential.expiresAt <= Date.now() : false;
+  return credential;
+}
 async function refreshCredential(force) {
-  if (!force && credential && Date.now() - credentialAt < 5 * 60 * 1000) return credential;
-  const c = await loadCredential(region);
-  if (c) {
-    credential = c;
+  if (!force && credential && Date.now() - credentialAt < 5 * 60 * 1000) return currentCredential();
+  const generation = ++credentialGeneration;
+  let result;
+  try { result = await loadCredential(region); }
+  catch { result = { status: 'temporary' }; }
+  if (generation !== credentialGeneration) return currentCredential();
+  if (result.status === 'valid') {
+    credential = result.credential;
     credentialAt = Date.now();
-  } else if (force) {
-    // 强制刷新就是要「重新读一次登录态」：读不到说明 Qoder 那边已经登出/掉线了，
-    // 这时候继续拿内存里的旧 token 去求上游，只会一路 401 让人以为插件坏了。
+  } else if (result.status === 'absent' || result.status === 'logged-out') {
     credential = undefined;
     credentialAt = 0;
   }
-  return credential;
+  // Transient IO / DPAPI / JSON failure is not evidence of logout.
+  return currentCredential();
 }
 
 function normalizeModel(m) {
@@ -468,6 +508,7 @@ function normalizeModel(m) {
 }
 
 async function refreshModels(force) {
+  assertOwnership();
   if (!force && models.length && Date.now() - modelsAt < 30 * 60 * 1000) return models;
   const cache = join(DATA_DIR, 'models.json');
   const cred = await refreshCredential(force);
@@ -544,13 +585,27 @@ function pickNumber(...vals) {
   return undefined;
 }
 
+function validQuotaBucket(bucket) {
+  if (bucket === null) return true;
+  if (!bucket || typeof bucket !== 'object' || Array.isArray(bucket)) return false;
+  const totals = ['total', 'totalAmount', 'quota', 'amount'];
+  if (!totals.some(k => Object.hasOwn(bucket, k))) return false;
+  return [...totals, 'used', 'usedAmount', 'consumed', 'remaining', 'left', 'balance']
+    .filter(k => Object.hasOwn(bucket, k)).every(k => {
+      const v = bucket[k];
+      return (typeof v === 'number' || (typeof v === 'string' && v.trim() !== ''))
+        && Number.isFinite(Number(v)) && Number(v) >= 0;
+    });
+}
+
 // 额度桶：有的版本给 total/used/remaining，有的只给 total/used。
 function normalizeBucket(src) {
-  if (!src || typeof src !== 'object') return undefined;
+  if (!src || !validQuotaBucket(src)) return undefined;
   const total = pickNumber(src.total, src.totalAmount, src.quota, src.amount);
   if (!(total > 0)) return undefined;
-  const used = pickNumber(src.used, src.usedAmount, src.consumed) ?? 0;
-  const remaining = pickNumber(src.remaining, src.left, src.balance) ?? Math.max(0, total - used);
+  const knownRemaining = pickNumber(src.remaining, src.left, src.balance);
+  const used = pickNumber(src.used, src.usedAmount, src.consumed) ?? Math.max(0, total - (knownRemaining ?? total));
+  const remaining = knownRemaining ?? Math.max(0, total - used);
   return {
     total, used, remaining,
     percentage: Math.min(1, Math.max(0, used / total)),
@@ -566,13 +621,9 @@ function validUsageResponse(response) {
   if (root.success === false || root.error) return false;
   const key = ['userQuota', 'user_quota'].find(k => Object.hasOwn(root, k));
   if (!key) return false;
-  const bucket = root[key];
-  // Explicit null represents no quota; absent/unknown fields do not.
-  if (bucket === null) return true;
-  if (!bucket || typeof bucket !== 'object' || Array.isArray(bucket)) return false;
-  const total = bucket.total ?? bucket.totalAmount ?? bucket.quota ?? bucket.amount;
-  return (typeof total === 'number' || (typeof total === 'string' && total.trim() !== ''))
-    && Number.isFinite(Number(total)) && Number(total) >= 0;
+  // Explicit null represents no quota; malformed present numeric fields are errors.
+  return ['userQuota', 'user_quota', 'addOnQuota', 'add_on_quota', 'addonQuota']
+    .filter(k => Object.hasOwn(root, k)).every(k => validQuotaBucket(root[k]));
 }
 
 // 用量面板：先走 /sash/api/v2/me/usage（给会员到期日、附加包、展示模式），
@@ -790,15 +841,13 @@ function writeJsonAtomic(file, value) {
   writeFileSync(tmp, JSON.stringify(value, null, 1));
   try { renameSync(tmp, file); }
   catch (e) {
-    // Windows 上目标被别的进程短暂占住时 rename 会失败，退回直写再清临时文件
-    try { writeFileSync(file, JSON.stringify(value, null, 1)); } finally {
-      try { unlinkSync(tmp); } catch {}
-    }
-    if (e && e.code !== 'EPERM' && e.code !== 'EACCES' && e.code !== 'EBUSY') throw e;
+    try { unlinkSync(tmp); } catch {}
+    throw e;
   }
 }
 
 function recordUsage(entry, wire, tokensIn, tokensOut) {
+  assertOwnership();
   try {
     const book = loadUsageBook();
     const day = localDayKey(Date.now());
@@ -958,7 +1007,10 @@ async function* streamChat(cred, req, signal) {
         if (!line.startsWith('data:')) continue;
         const p = line.slice(5).trim();
         if (!p) continue;
-        if (p === '[DONE]') { done = true; sawEnd = true; break; }
+        if (p === '[DONE]') {
+          if (!sawEnd) yield { choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] };
+          done = true; sawEnd = true; break;
+        }
         let env;
         try { env = JSON.parse(p); } catch { continue; }
         let chunk = env;
@@ -1118,21 +1170,16 @@ function isLoopbackAddr(a) {
 // 只放行 loopback。以前是按字符串前缀判 `127.0.0.1:`（要求带冒号带端口），
 // 结果不带端口的 Host（部分 SDK / 代理会去掉默认端口）直接被 403 —— claude-code
 // 引擎走 Cindy 的 anthropic-compat-proxy 中转时就踩了这个坑。
-// 现在按 hostname 判，端口可有可无，[::1] 与 ::1 都认。
+// 校验完整 authority：端口可有可无，IPv6 必须带方括号。
 function hostOk(req) {
   const raw = String(req.headers.host || '').toLowerCase().trim();
   if (!raw) return isLoopbackAddr(req.socket && req.socket.remoteAddress);
-  let hostname = raw;
-  if (hostname.startsWith('[')) {
-    const end = hostname.indexOf(']');
-    hostname = end !== -1 ? hostname.slice(0, end + 1) : hostname;
-  } else {
-    const colon = hostname.lastIndexOf(':');
-    if (colon !== -1 && hostname.indexOf(':') === colon) hostname = hostname.slice(0, colon);
-  }
-  if (!hostname) return false;
-  if (hostname === 'localhost' || hostname === '[::1]' || hostname === '::1') return true;
-  return /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(hostname);
+  const match = /^(\[::1\]|localhost|127\.\d{1,3}\.\d{1,3}\.\d{1,3})(?::(\d+))?$/.exec(raw);
+  if (!match) return false;
+  if (match[2] !== undefined && !(Number(match[2]) >= 1 && Number(match[2]) <= 65535)) return false;
+  const hostname = match[1];
+  if (hostname === 'localhost' || hostname === '[::1]') return true;
+  return hostname.split('.').every(part => Number(part) <= 255);
 }
 
 function authOk(req) {
@@ -1210,7 +1257,7 @@ async function handle(req, res) {
   }
   if ((url === '/v1/messages/count_tokens' || url === '/v1/messages/count_tokens/') && req.method === 'POST') {
     if (!authOk(req)) { sendJson(res, 401, { error: { message: '本地 API Key 不对：面板上那串 Token 要一字不差地填进 Cindy 的 API Key 栏。' } }); return; }
-    const parsed = await readJsonBody(req, res);
+    const parsed = await readGenerationBody(req, res, 'anthropic');
     if (!parsed.ok) return;
     let chat;
     try {
@@ -1239,12 +1286,24 @@ function normalizeModelKey(id) {
   return /\[1m\]$/i.test(s) ? s.slice(0, -4) : s;
 }
 
-async function chatCompletions(req, res) {
+async function readGenerationBody(req, res, protocol) {
   const parsed = await readJsonBody(req, res);
+  if (!parsed.ok) return parsed;
+  const body = parsed.value;
+  let error;
+  if (!body || typeof body !== 'object' || Array.isArray(body)) error = '请求体必须是对象';
+  else if (protocol === 'responses') {
+    if (typeof body.input !== 'string' && !Array.isArray(body.input)) error = 'input 必须是字符串或数组';
+  } else if (!Array.isArray(body.messages) || !body.messages.length) error = 'messages 必须是非空数组';
+  if (!error) return parsed;
+  sendJson(res, 400, { error: { message: error, type: 'invalid_request_error' } });
+  return { ok: false };
+}
+
+async function chatCompletions(req, res) {
+  const parsed = await readGenerationBody(req, res, 'chat');
   if (!parsed.ok) return;
-  // body 可能是 JSON 标量（null、数字、字符串）：一律当空对象处理，
-  // 让后面的校验按 400 回，而不是在这里读 .model 抛 TypeError 变 500。
-  const payload = parsed.value && typeof parsed.value === 'object' ? parsed.value : {};
+  const payload = parsed.value;
 
   const displayModel = normalizeModelKey(payload.model);
   const entry = models.find((m) => m.key === displayModel);
@@ -1278,7 +1337,7 @@ async function chatCompletions(req, res) {
   const cred = await refreshCredential(false);
   if (!cred) { sendJson(res, 401, { error: { message: 'Qoder 未登录或凭证无法解密' } }); return; }
 
-  const wantStream = payload.stream !== false;
+  const wantStream = payload.stream === true;
   const controller = new AbortController();
   const cancelOnClose = bindAbort(req, res, controller);
 
@@ -1306,7 +1365,7 @@ async function chatCompletions(req, res) {
   }
 
   if (!wantStream) {
-    const content = []; const calls = new Map(); let finish = 'stop'; let usage;
+    const content = []; const reasoning = []; const calls = new Map(); let finish = 'stop'; let usage;
     try {
       for (let s = first; !s.done; s = await iterator.next()) {
       const c = s.value;
@@ -1315,6 +1374,8 @@ async function chatCompletions(req, res) {
       if (!ch) continue;
       const d = ch.delta || ch.message || {};
       if (typeof d.content === 'string') content.push(d.content);
+      const r = d.reasoning_content ?? d.reasoning;
+      if (typeof r === 'string') reasoning.push(r);
       if (Array.isArray(d.tool_calls)) for (const t of d.tool_calls) {
         const i = t.index ?? 0;
         const cur = calls.get(i) || { id: '', type: 'function', function: { name: '', arguments: '' } };
@@ -1335,6 +1396,7 @@ async function chatCompletions(req, res) {
       return;
     }
     const message = { role: 'assistant', content: content.join('') };
+    if (reasoning.length) message.reasoning_content = reasoning.join('');
     if (calls.size) message.tool_calls = [...calls.values()];
     cancelOnClose.done();
     recordUsage(entry || { model: displayModel }, 'chat', usage?.prompt_tokens, usage?.completion_tokens);
@@ -1425,7 +1487,7 @@ async function openUpstream(req, res, request, displayModel) {
 }
 
 async function anthropicMessages(req, res) {
-  const parsed = await readJsonBody(req, res);
+  const parsed = await readGenerationBody(req, res, 'anthropic');
   if (!parsed.ok) return;
 
   let chat;
@@ -1463,7 +1525,7 @@ async function anthropicMessages(req, res) {
   const up = await openUpstream(req, res, request, displayModel);
   if (!up.ok) return;
 
-  const opts = { model: displayModel, inputTokens: adapters.estimateTokens(chat.messages) };
+  const opts = { model: displayModel, inputTokens: adapters.estimateTokens(chat.messages), formatError: (error) => errorBodyOf(error).error };
   // 上游给了真实 usage 就用真实值记账；适配层会把它写在 opts.usage 上回传。
   try {
     if (chat.stream) await adapters.writeAnthropicStream(res, up.first, up.iterator, opts);
@@ -1480,7 +1542,7 @@ async function anthropicMessages(req, res) {
 }
 
 async function openaiResponses(req, res) {
-  const parsed = await readJsonBody(req, res);
+  const parsed = await readGenerationBody(req, res, 'responses');
   if (!parsed.ok) return;
 
   let chat;
@@ -1517,7 +1579,7 @@ async function openaiResponses(req, res) {
   const up = await openUpstream(req, res, request, displayModel);
   if (!up.ok) return;
 
-  const opts = { model: displayModel, inputTokens: adapters.estimateTokens(chat.messages) };
+  const opts = { model: displayModel, inputTokens: adapters.estimateTokens(chat.messages), formatError: (error) => errorBodyOf(error).error };
   // 上游给了真实 usage 就用真实值记账；适配层会把它写在 opts.usage 上回传。
   try {
     if (chat.stream) await adapters.writeResponsesStream(res, up.first, up.iterator, opts);
@@ -1562,8 +1624,21 @@ function portIsOurs(port) {
   });
 }
 
+let serverStarting;
 async function startServer() {
+  if (serverStarting) return serverStarting;
   if (server) return;
+  serverStarting = startServerOnce();
+  try { await serverStarting; }
+  catch (e) {
+    try { server?.close(); } catch {}
+    server = null;
+    actualPort = 0;
+    throw e;
+  } finally { serverStarting = null; }
+}
+
+async function startServerOnce() {
   server = http.createServer((req, res) => {
     handle(req, res).catch((e) => {
       log('handler error', e.message);
@@ -1608,7 +1683,6 @@ async function startServer() {
     // 一个端口都没抢到：必须把 server 放回 null，否则下一次 RPC 的 `if (!server) await boot()`
     // 看到的是这个已经废掉的 http.Server 实例，于是永远不再重试，进程变成僵尸
     // （RPC 还在答，但 actualPort 是 0，客户端一直连不上）。
-    server = null;
     throw new Error(`端口 ${PREFERRED_PORT}..${PREFERRED_PORT + 19} 都被占用`);
   }
   actualPort = bound;
@@ -1616,7 +1690,15 @@ async function startServer() {
   log(`已在 127.0.0.1:${actualPort} 监听`);
 }
 
-async function boot() {
+let bootPending;
+function boot() {
+  if (!bootPending) bootPending = bootOwned().finally(() => { bootPending = undefined; });
+  return bootPending;
+}
+async function bootOwned() {
+  await ensureOwnership();
+  updateStatus.assertRecoverable(UPDATE_DIR);
+  if (actualPort) return;
   bootedAt = Date.now();
   mkdirSync(DATA_DIR, { recursive: true });
   const st = loadState();
@@ -1629,6 +1711,7 @@ async function boot() {
 }
 
 async function buildStatus() {
+  const updateResult = updateStatus.readLatest(UPDATE_DIR);
   const cred = await refreshCredential(false);
   // boot 里这两项是后台跑的（不挡端口起来），面板第一次问状态时补一次，
   // 之后都走各自的缓存。给 4 秒上限：面板 12 秒超时，不能让它等到网络超时。
@@ -1661,6 +1744,7 @@ async function buildStatus() {
     checkin: { ...(lastCheckin || { active: false }), ...scheduled },
     localUsage: usageSummary(),
     logFile: LOG_FILE,
+    updateResult,
     uptimeSeconds: Math.floor((Date.now() - bootedAt) / 1000),
     // 只报还活着的错误（成功刷新会按来源清掉），并带上「多久以前」。
     lastError: lastErrorText(),
@@ -1680,8 +1764,8 @@ async function buildStatus() {
 
 const UPDATE_REPO = process.env.QODER_BRIDGE_REPO || 'linvisxie/cindy-qoder-bridge';
 const UPDATE_API = `https://api.github.com/repos/${UPDATE_REPO}/releases/latest`;
-const UPDATE_DIR = join(DATA_DIR, 'update');
 const INSTALL_DIR = join(__dirname, '..');
+const UPDATE_DIR = updateStatus.updateDirectory(INSTALL_DIR);
 
 // 版本比较、digest 校验、zip 解包、脚本生成都在 node/update.cjs ——
 // 那一份是纯函数、可以离线跑回归测试；这里只留需要 IO 的部分。
@@ -1738,13 +1822,28 @@ async function checkUpdate() {
 // 更新在途锁：面板连点或面板+工具两路同时喊 applyUpdate 时，只允许一个真的下载安装，
 // 其余直接回「正在进行」。原来没有任何互斥，两次下载、两个安装脚本抢同一个安装目录是可能的。
 let updateInFlight = false;
+let activeUpdateAttempt;
 async function applyUpdate() {
+  await ensureOwnership();
+  updateStatus.assertRecoverable(UPDATE_DIR);
   if (updateInFlight) {
     return { applied: false, error: '更新已在进行中', message: '更新已在进行中，不用重复点，等它装完自动重启。' };
   }
   updateInFlight = true;
-  try { return await applyUpdateOnce(); }
-  finally { updateInFlight = false; }
+  let handedOff = false;
+  try {
+    const result = await applyUpdateOnce();
+    handedOff = result.applied === true;
+    return result;
+  } catch (error) {
+    if (activeUpdateAttempt) updateStatus.writeResult(activeUpdateAttempt, {
+      status: 'not_started', phase: 'failed', error: error.message,
+      hostReceipt: 'requires_host_install',
+    });
+    throw error;
+  } finally {
+    if (!handedOff) { updateInFlight = false; activeUpdateAttempt = undefined; }
+  }
 }
 
 async function applyUpdateOnce() {
@@ -1753,12 +1852,11 @@ async function applyUpdateOnce() {
   if (!info.asset) throw new Error('最新 release 里没有 .cindy 包，无法更新');
 
   mkdirSync(UPDATE_DIR, { recursive: true });
-  const res = await fetch(info.asset.url, {
-    headers: { 'User-Agent': 'qoder-bridge' },
-    signal: AbortSignal.timeout(120000),
+  const attemptId = 'attempt-' + crypto.randomUUID();
+  activeUpdateAttempt = updateStatus.begin(UPDATE_DIR, attemptId, { version: info.latest, hostReceipt: 'requires_host_install' });
+  const bytes = await download.downloadReleaseAsset(info.asset, {
+    repo: UPDATE_REPO, version: info.latest, fetch, signal: AbortSignal.timeout(120000),
   });
-  if (!res.ok) throw new Error(`下载新版本失败：HTTP ${res.status}`);
-  const bytes = Buffer.from(await res.arrayBuffer());
 
   // 先验再落盘：校验不过就一个字节都不写进安装目录，当前版本继续跑。
   const check = updater.verifyDigest(bytes, info.asset.digest, info.asset.size);
@@ -1768,31 +1866,31 @@ async function applyUpdateOnce() {
   // A matching digest proves bytes, not plugin identity or runnable contents.
   updater.validatePackage(readZipEntries(bytes), {
     id: 'qoder-bridge', version: info.latest, currentVersion: info.current,
-    required: ['node/adapters.cjs', 'node/update.cjs'],
+    required: ['node/bootstrap.cjs', 'node/adapters.cjs', 'node/update.cjs', 'node/ownership.cjs', 'node/download.cjs', 'node/update-status.cjs'],
   });
 
   const stageDir = mkdtempSync(join(UPDATE_DIR, 'stage-'));
   // Unique paths also isolate concurrent update attempts and stale staging files.
   const scriptPath = `${stageDir}.ps1`;
-  const syncScriptPath = `${stageDir}.cjs`;
   const packagePath = `${stageDir}.cindy`;
-  const backup = `${INSTALL_DIR}.bak-${info.current}`;
+  const backup = `${INSTALL_DIR}.bak-${info.current}-${attemptId}`;
   let child;
   try {
     writeFileSync(packagePath, bytes);
     extractZipTo(bytes, stageDir);
-    writeFileSync(syncScriptPath, updater.buildSnapshotSyncScript({ installDir: INSTALL_DIR, pkgPath: packagePath }), 'utf8');
     writeFileSync(scriptPath, updater.buildApplyScript({
-      root: INSTALL_DIR, stage: stageDir, backup, pkg: packagePath,
-      syncScript: syncScriptPath, nodeExe: process.execPath, oldPid: process.pid,
+      root: INSTALL_DIR, stage: stageDir, backup, pkg: packagePath, oldPid: process.pid,
+      attemptDir: activeUpdateAttempt, latestPointer: join(UPDATE_DIR, 'latest-attempt.json'), installationPipe: pipeName(INSTALL_DIR, 'install'), ownershipPipe: pipeName(DATA_DIR),
     }), 'utf8');
+    updateStatus.writeResult(activeUpdateAttempt, { status: 'handed_off', phase: 'waiting',
+      version: info.latest, backup, hostReceipt: 'requires_host_install' });
     child = spawn('powershell.exe', ['-NoProfile', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', scriptPath], {
       detached: true, stdio: 'ignore', windowsHide: true,
     });
     await updater.waitForSpawn(child);
   } catch (e) {
     rmSync(stageDir, { recursive: true, force: true });
-    for (const file of [packagePath, scriptPath, syncScriptPath]) rmSync(file, { force: true });
+    for (const file of [packagePath, scriptPath]) rmSync(file, { force: true });
     throw new Error(`无法启动更新安装：${e.message}`);
   }
   child.unref();
@@ -1804,10 +1902,11 @@ async function applyUpdateOnce() {
 
   return {
     ...info,
-    applied: true,
+    applied: true, status: 'handed_off',
     backup,
     scriptPath,
-    message: `已下载 ${info.latest} 并成功启动后台安装脚本；worker 正在退出，Cindy 大约 20~30 秒后用新版本重新拉起。`,
+    resultPath: join(activeUpdateAttempt, 'result.json'),
+    message: `已下载 ${info.latest} 并交接安装器，尚不代表安装完成。最终结果见插件状态及 ${join(activeUpdateAttempt, 'result.json')}；宿主安装记录需通过 Cindy 原生导入完整包刷新。`,
   };
 }
 
@@ -1830,6 +1929,7 @@ rl.on('line', async (line) => {
   const method = req.method;
 
   try {
+    await ensureOwnership();
     let result;
     if (method === 'qoder/status') {
       if (!server) await boot();

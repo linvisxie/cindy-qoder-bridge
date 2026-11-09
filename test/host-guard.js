@@ -14,7 +14,7 @@ const path = require('node:path');
 const fs = require('node:fs');
 const os = require('node:os');
 
-const WORKER = path.join(__dirname, '..', 'plugin', 'node', 'worker.cjs');
+const WORKER = path.join(__dirname, '..', 'plugin', 'node', 'bootstrap.cjs');
 const PORT = Number(process.env.HOST_GUARD_PORT || 47955);
 
 let pass = 0;
@@ -47,7 +47,7 @@ function request(hostHeader) {
 async function main() {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'qoder-hostguard-'));
   const child = spawn(process.execPath, [WORKER], {
-    env: { ...process.env, CINDY_QODER_DATA: dataDir, CINDY_QODER_PORT: String(PORT) },
+    env: { ...process.env, APPDATA: dataDir, LOCALAPPDATA: dataDir, USERPROFILE: dataDir, HOME: dataDir, CINDY_QODER_DATA: dataDir, CINDY_QODER_PORT: String(PORT) },
     stdio: ['pipe', 'pipe', 'pipe'],
   });
   child.stderr.on('data', () => {});
@@ -74,11 +74,22 @@ async function main() {
     'localhost:' + PORT,
     '[::1]',
     '[::1]:' + PORT,
-    '::1',
     '127.0.0.2',
   ];
   // 必须拒绝的
   const deny = [
+    '::1',
+    '[::1].evil.com',
+    '[::1]:80.evil.com',
+    '[::1]:',
+    '[::1]:0',
+    '[::1]:65536',
+    '[::1]:bad',
+    '127.999.999.999',
+    '127.0.0.256',
+    '127.0.0.1:',
+    '127.0.0.1:65536',
+    'localhost:bad',
     'example.com',
     'evil.com:' + PORT,
     '10.0.0.1:' + PORT,

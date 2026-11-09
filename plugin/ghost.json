@@ -12,7 +12,7 @@
   "launch": "resident",
   "command": "qoder",
   "node": {
-    "entry": "node/worker.cjs",
+    "entry": "node/bootstrap.cjs",
     "protocol": "json-rpc-stdio",
     "lifecycle": "resident"
   },

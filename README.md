@@ -66,17 +66,21 @@ Qoder 不是 OpenAI 兼容端点，所以需要三样东西：
 
 登录态是每次现从 Qoder CN 客户端目录里的 `auth.v1.dat` 解的（OSCrypt v10 → DPAPI），**只在内存里用，不落盘**。
 
-四个组件：
+主要组件：
 
 | 文件 | 角色 |
 |---|---|
 | `plugin/main.js` | 电子脑：把 AI 的工具调用与面板请求转给 worker |
+| `plugin/node/bootstrap.cjs` | 清单 `node.entry`（`node/bootstrap.cjs`）：先取得安装目录与数据目录双锁，再加载全部业务模块 / worker |
 | `plugin/node/worker.cjs` | Node 常驻进程：解密登录态、起 HTTP 服务、三条协议路由 |
 | `plugin/node/adapters.cjs` | Anthropic / Responses 与 OpenAI Chat 之间的协议翻译 |
 | `plugin/node/update.cjs` | 自更新纯函数：版本比较、digest 校验、zip 解包、脚本生成 |
+| `plugin/node/download.cjs` | 限制更新下载地址、重定向与包大小 |
+| `plugin/node/ownership.cjs` | 安装目录与运行数据目录的 OS 独占所有权 |
+| `plugin/node/update-status.cjs` | 更新 journal attempt / result 与中断恢复启动检查 |
 | `plugin/panel.*` | 右侧栏面板：账号、额度、签到、模型列表、Base URL / API Key |
 
-它**不改 Cindy 的任何文件**，也不替你填供应商配置（Cindy 没给插件这个接口）。它就是给你一个端点，剩下那步在 Cindy 界面里点。
+它只管理自身插件文件与运行数据，**不直接修改 Cindy 的宿主安装收据或供应商配置**。供应商仍需在 Cindy 界面手动添加；自更新与宿主安装记录的区别见下文。
 
 ## 环境依赖（请逐条核对）
 
@@ -147,11 +151,12 @@ Cindy → 插件页 → 导入 `.cindy`（也可以直接把文件拖进去）�
 
 正常启动 Cindy 就行。插件是 `resident`，Cindy 起来自己把 worker 拉到 `47821`；token 持久化在 `state.json`，供应商配置存在 Cindy 自己的数据库里，都不用再管。
 
-**只有这三种情况需要你动手：**
+**以下情况需要你动手：**
 
 1. Qoder 登录过期 → 在 Qoder CN 客户端重新登录，然后点面板上的「刷新」。
 2. `47821` 被别的软件占了 → worker 会顺延到 `47822`…，此时面板显示的 Base URL 变了，要去 Cindy 里改一下。
 3. 卸载重装插件 → 供应商要重新填一次。
+4. 自更新替换运行文件后 → 用 Cindy 原生导入完整 `.cindy` 包刷新宿主安装记录。
 
 ## 面板能看什么
 
@@ -165,6 +170,17 @@ Cindy → 插件页 → 导入 `.cindy`（也可以直接把文件拖进去）�
 
 AI 侧也能问：`qoder_status`、`qoder_endpoint`、`qoder_refresh`、`qoder_checkin`、`qoder_update` 五个工具。`qoder_update` 传 `action=apply` 就会下载安装。
 
+## 更新安全与运行边界
+
+- 更新必须提供合法的 **64 位十六进制 SHA-256** 并匹配包内容，不再降级成仅比较 size。下载仅接受本仓库指定 repo / tag / asset 的 GitHub HTTPS 地址；重定向逐跳检查允许域名，最多 5 跳，包上限 32 MiB。
+- 安装器等待旧 PID 退出；未退出就停止，不覆盖文件。退出后同样按 `INSTALL_DIR`（`install`）→ `DATA_DIR`（`data`）固定顺序取得 OS 独占锁，并在安装全过程持有双锁。取得双锁后，安装器校验 `latest-attempt.json` 的 attempt 身份；迟到脚本发现指针换代或不存在即拒绝复制。每次更新持久化 journal attempt / result；复制失败尝试回滚，回滚不覆盖 journal，失败保留诊断和 backup。`update-status` 检测到中断的 copy / rollback 会禁止 boot；journal `begin` 与 `applyUpdate` 均禁止覆盖尚未恢复的 attempt 指针，`begin` 拒绝 previous `handed_off`。pending handoff 未确认结果时不能发起新更新，应先检查 `<安装目录>.updates/install.log`，不保证自动重试。
+- 持久更新目录统一为 `UPDATE_DIR = canonicalDirectory(INSTALL_DIR) + '.updates'`，即规范化安装目录同级的 `<安装目录>.updates`，不再使用数据目录的 `update/`。bootstrap、worker 与安装器都检查这里的 journal，与 `DATA_DIR` 无关，换数据目录不能绕过，rollback 也不覆盖它。
+- **中断恢复需手动处理 journal，原生导入不会自动解除阻断。** Cindy 原生导入完整 `.cindy` 包不会清除安装目录同级的 journal。中断 copy / rollback 失败后，保留所有日志与 backup；通过 Cindy 原生导入完整包并确认成功后，停用插件，将 `<安装目录>.updates/latest-attempt.json` **重命名保留诊断**，再启用插件。不要删除备份和日志。
+- **自更新成功仅表示插件运行文件替换成功，不代表 Cindy 的宿主安装记录已刷新。** 不再自动同步宿主安装快照，也不直接写 `ghost-install-state` 安装收据或通过 `process.execPath` 执行同步脚本。Cindy 0.1.128 尚无已验证的公开插件自写收据 API；请通过 **Cindy 插件页原生导入完整 `.cindy` 包**刷新安装记录。
+- 清单 `node.entry` 为 `node/bootstrap.cjs`：先按 `INSTALL_DIR`（`install`）→ `DATA_DIR`（`data`）固定顺序取得 OS 独占锁，之后才加载全部业务模块 / worker。Windows 使用命名管道，Linux abstract socket 仅用于 offline CI，不代表支持 Linux 运行插件。**同一安装目录即使数据目录不同也拒绝同时运行；不同端口也不能共享数据目录。多实例的安装目录和数据目录必须都不同。**
+- Qoder 凭据读取区分 `valid` / `absent` / `logged-out` / `temporary`，过期按当前时间判断；临时读取失败不等同登出。适配器流中错误使用 worker 的 `formatError` 中文分类，保留已获 usage，并按失败终止，不伪装成正常完成。
+- Cindy 0.1.128 通过 `require` 加载 Node entry，已验证与 bootstrap 兼容；这不等于本轮改动已发布或安装。本轮 Windows 故障验证使用真实临时目录，**不是真实插件安装验证**；没有真实用户登录 / 退出测试。测试通过不代表无 bug，也不扩大原有权限。
+
 ## 运行数据在哪
 
 | 路径 | 内容 |
@@ -173,7 +189,7 @@ AI 侧也能问：`qoder_status`、`qoder_endpoint`、`qoder_refresh`、`qoder_c
 | `%APPDATA%\CindyGlobal\qoder-bridge\state.json` | 本地端点 token + 端口 |
 | `%APPDATA%\CindyGlobal\qoder-bridge\models.json` | 模型目录缓存（30 分钟） |
 | `%APPDATA%\CindyGlobal\qoder-bridge\usage.json` | 本地用量账本（按天按模型，留 60 天） |
-| `%APPDATA%\CindyGlobal\qoder-bridge\update\` | 自查更新的下载包、暂存目录与替换脚本 |
+| `<安装目录>.updates/`（`UPDATE_DIR`） | 安装目录同级的持久更新 journal、`latest-attempt.json`、`install.log`、下载包、暂存目录与替换脚本；与数据目录无关 |
 | `%APPDATA%\CindyGlobal\qoder-bridge\bridge.log` | 运行日志，超 2 MB 自动滚成 `.1` |
 
 **你的 Qoder token 不会被写进这些文件** —— 每次都是现从 Qoder 客户端目录里的 `auth.v1.dat` 解密，只在内存里用。
@@ -188,28 +204,37 @@ AI 侧也能问：`qoder_status`、`qoder_endpoint`、`qoder_refresh`、`qoder_c
 
 ## 开发与测试
 
-`test/` 下每个脚本都是独立的、可复跑的判据。多数脚本**需要先装好并登录 Qoder CN**（要真读登录态、真打上游）；纯本地的有 `host-guard`、`responses-status`、`upstream-contract`、`update-chain`、`review-regressions`。没登录时 `features` 与 `e2e-panel` 会把依赖登录态的用例打 `--` / `SKIP` 跳过，不会崩，但那样等于没验到。
+`test/` 下每个脚本都是独立的、可复跑的判据。多数脚本**需要先装好并登录 Qoder CN**（要真读登录态、真打上游）；纯本地脚本包括 `host-guard`、`responses-status`、`upstream-contract`、`update-chain`、`review-regressions`，以及下列审查回归脚本。没登录时 `features` 与 `e2e-panel` 会把依赖登录态的用例打 `--` / `SKIP` 跳过，不会崩，但那样等于没验到。
 
 ```bat
 cd plugin && npm run verify     :: 清单静态校验
 cd plugin && npm run pack       :: 打包
 
-node test\host-guard.js         :: Host 守卫 13 项（纯本地，不需要登录）
-node test\responses-status.js   :: Responses 状态映射 19 项（纯本地，不需要登录）
-node test\upstream-contract.js  :: 上游契约 16 项（纯本地：交错工具分片 / 截断判定 / usage 回传）
-node test\update-chain.js       :: 自更新链路 52 项（纯本地：版本比较 / digest fail-closed / 解包 / 回滚脚本生成）
-node test\review-regressions.js :: 历次复审行为回归 40 项（纯本地：额度容错 / 错误映射 / 打包身份校验）
-node test\e2e-package.js        :: 包端到端 25 项（解包 → 起 worker → 真对话 → 三条协议）
-node test\e2e-panel.js          :: 面板脚本 10 项
-node test\e2e-brain.js          :: 面板 ↔ 电子脑真实总线 13 项
-node test\smoke-protocols.js    :: 三条协议形状 19 项
-node test\smoke-tools.js        :: 三条协议的 tool call 11 项
-node test\wire-quirks.js        :: Cindy 的 /v1/v1 与 [1m] 怪癖 10 项
-node test\features.js           :: 签到 / 用量 / 日志 / 倍率 / 错误码 / 输入校验 42 项
+node test\host-guard.js
+node test\responses-status.js
+node test\upstream-contract.js
+node test\update-chain.js
+node test\review-regressions.js
+node test\protocol-defaults-reasoning.js :: 协议默认值与 Responses reasoning 回归
+node test\bootstrap.js              :: offline：加锁后才加载业务模块
+node test\ownership.js              :: 安装目录与数据目录双锁
+node test\update-download.js        :: 下载限制
+node test\update-install-results.js :: 安装故障与结果记录
+node test\update-status.js          :: 更新中断与启动阻断
+node test\credential-reading.js     :: 凭据分类与过期
+node test\e2e-package.js
+node test\e2e-panel.js
+node test\e2e-brain.js
+node test\smoke-protocols.js
+node test\smoke-tools.js
+node test\wire-quirks.js
+node test\features.js
 ```
 
 想换模型：`node test\smoke-protocols.js <模型 id>`（默认 `qfmodel`，免费）。
-每个测试自己开临时目录与独立端口，不会踩到正在跑的实例。
+隔离测试使用临时安装副本、临时数据目录与独立端口，不与正在运行的实例共享安装目录或数据目录。`test/bootstrap.js` 登记为 offline，验证双锁取得前不加载业务模块 / worker，以及目录冲突拒绝启动；不需要登录态或真实安装，也不代表真实插件安装验证。
+
+本轮新增 `test/protocol-defaults-reasoning.js`；代码完成，待最终验证，尚未发布 / 安装。测试结果与统计以 `node .github/scripts/ci-run.cjs --mode offline` 及上述单项命令的实际输出为准，不固定断言数；未运行 / SKIP 不等于通过。
 
 ### CI 跑哪些、哪些只能在本地跑
 
@@ -246,7 +271,7 @@ node .github\scripts\ci-run.cjs --mode offline   :: 与 GitHub Actions 同一份
 - **上下文只能报一个数。** Cindy 的供应商模型只认单一数值，所以报了最大档 1M。
 - **额度重置时间拿不到。** Qoder 的 `/sash/api/v2/me/usage` 不返回这个字段（实测返回的键里没有），面板会显示「Qoder 接口没给」。
 - **依赖 Qoder 的内部接口。** 上游一改，插件就失效。这不是「长期稳定」的东西。
-- **省略 `stream` 时按流式返回**，与三份官方协议的默认值（非流式）相反。这是刻意的兼容取舍：Cindy 的 Anthropic 接入探测不传 `stream` 字段，且按 `text/event-stream` 解析响应；若改成官方语义，保存供应商的探测会直接判定「接入不兼容」。标准 SDK 想拿非流式响应，显式传 `stream: false` 即可。详见 issue #15。
+- **本轮协议兼容性行为变更（代码完成，待最终验证，尚未发布 / 安装）**：旧 issue #15（stream 默认值）与 #19（Responses reasoning）同属本轮剩余问题范围，不再暂缓。三协议仅在 `stream === true` 时返回 SSE；缺省或 `false` 返回单个 JSON。上游仍可使用 `stream: true` 再聚合。Responses 流式 / 非流式提供含 `summary_text` 的 reasoning item；流式使用标准 `response.reasoning_summary_part.*` / `response.reasoning_summary_text.*` 事件，只传递真实上游推理内容与 usage，不虚构。依赖旧默认流式行为的调用方需显式传 `stream: true`；尚不能将本轮行为视为已安装版本的能力。
 
 ## 免责声明
 
@@ -259,7 +284,7 @@ node .github\scripts\ci-run.cjs --mode offline   :: 与 GitHub Actions 同一份
 1. **这是逆向实现，不是官方接口。** 请求体里冒充 Qoder CLI 的身份（`session_type: "qodercli"`、`agent_id: "agent_common"` 等）去打它自己的网关。Qoder 的用户协议大概率不允许这类用法。
 2. **风险自负。** 可能导致账号被风控、配额被清零、甚至封号。作者不为此承担任何责任，也不提供任何保证。
 3. **不要用它做违反上游条款的事**，也不要拿它去绕过计费或配额限制 —— 它没有绕过任何东西，用的就是你自己账号的配额。
-4. **登录态只在本机内存里。** 插件不收集、不上传你的 token、聊天内容或任何账号信息。要审计的话，网络出口只有两个域名：`gateway.qoder.com.cn`、`openapi.qoder.com.cn`。
+4. **登录态只在本机内存里。** 插件不收集、不上传你的 token、聊天内容或任何账号信息。上游账号接口使用 `gateway.qoder.com.cn`、`openapi.qoder.com.cn`；检查更新还访问 GitHub API，下载还访问经允许列表校验的 GitHub Release 域名。
 5. `%APPDATA%\CindyGlobal\qoder-bridge\` 里会留运行日志和用量账本，**分享日志前先自己看一眼**。
 
 ## 许可

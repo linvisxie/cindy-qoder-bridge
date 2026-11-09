@@ -9,7 +9,7 @@ const { mkdtempSync, writeFileSync } = require('node:fs');
 const { join } = require('node:path');
 const os = require('node:os');
 
-const WORKER = join(__dirname, '..', 'plugin', 'node', 'worker.cjs');
+const WORKER = join(__dirname, '..', 'plugin', 'node', 'bootstrap.cjs');
 const MODEL = process.argv[2] || 'qfmodel';
 
 const dir = mkdtempSync(join(os.tmpdir(), 'qoder-tools-'));

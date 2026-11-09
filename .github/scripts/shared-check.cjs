@@ -27,6 +27,8 @@ const ROOT = resolve(__dirname, '..', '..');
 // 必须逐字相同的文件。
 const SHARED_EXACT = [
   '.github/scripts/ci-run.cjs',
+  '.github/scripts/shared-check.cjs',
+  '.github/workflows/shared-drift.yml',
   '.github/scripts/check-version.cjs',
   '.github/scripts/verify-package.cjs',
   '.github/scripts/release-notes.cjs',
@@ -35,6 +37,10 @@ const SHARED_EXACT = [
   '.github/workflows/ci.yml',
   '.github/workflows/release.yml',
   'plugin/node/update.cjs',
+  'plugin/node/ownership.cjs',
+  'plugin/node/bootstrap.cjs',
+  'plugin/node/download.cjs',
+  'plugin/node/update-status.cjs',
 ];
 
 // 只要求「去掉注释与空行后」相同的文件。

@@ -7,7 +7,7 @@ const { join } = require('node:path');
 const os = require('node:os');
 const http = require('node:http');
 
-const WORKER = join(__dirname, '..', 'plugin', 'node', 'worker.cjs');
+const WORKER = join(__dirname, '..', 'plugin', 'node', 'bootstrap.cjs');
 const PORT = 47961;
 // 默认用免费模型；想换：node test/wire-quirks.js <模型 id>
 const MODEL = process.argv[2] || 'qfmodel';
@@ -56,7 +56,7 @@ function check(name, ok, got) { checks.push([name, ok, got]); console.log((ok ? 
   check('worker 起来了', inner.ok !== false && !!port, port);
 
   // ---- 1. 重复 /v1 路径折叠 ----
-  const msg = { model: MODEL, max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] };
+  const msg = { model: MODEL, max_tokens: 16, stream: true, messages: [{ role: 'user', content: 'hi' }] };
   const a = await post(port, '/v1/messages', token, msg);
   check('/v1/messages 正常 200', a.status === 200, a.status);
   const b = await post(port, '/v1/v1/messages', token, msg);

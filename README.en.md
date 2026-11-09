@@ -75,19 +75,21 @@ Qoder is not an OpenAI-compatible endpoint, so three things are needed:
 The login state is decrypted fresh from the Qoder CN client's `auth.v1.dat`
 (OSCrypt v10 → DPAPI) on each read, **used only in memory, never written to disk**.
 
-Four components:
+Main components:
 
 | File | Role |
 |---|---|
 | `plugin/main.js` | The brain: forwards AI tool calls and panel requests to the worker |
+| `plugin/node/bootstrap.cjs` | Manifest `node.entry` (`node/bootstrap.cjs`): acquires install and data locks before loading any business modules / worker |
 | `plugin/node/worker.cjs` | Resident Node process: decrypts login state, serves HTTP, routes three protocols |
 | `plugin/node/adapters.cjs` | Protocol translation between Anthropic / Responses and OpenAI Chat |
 | `plugin/node/update.cjs` | Pure functions for self-update: version compare, digest check, unzip, script generation |
+| `plugin/node/download.cjs` | Update URL, redirect and package-size restrictions |
+| `plugin/node/ownership.cjs` | OS-exclusive ownership of the install and runtime data directories |
+| `plugin/node/update-status.cjs` | Update journal attempt / result and interrupted-update boot guards |
 | `plugin/panel.*` | Right-side panel: account, quota, check-in, model list, Base URL / API key |
 
-It **does not modify any Cindy file**, and it won't fill in the provider config for you
-(Cindy doesn't expose an interface for that). It gives you an endpoint; the last step is
-a few clicks in Cindy's UI.
+It manages its own plugin files and runtime data, **not Cindy's host installation receipt or provider configuration**. Add providers manually in Cindy; see the self-update limitations below.
 
 ## Requirements (check each one)
 
@@ -178,12 +180,13 @@ Just start Cindy normally. The plugin is `resident`, so Cindy pulls the worker u
 `47821` on its own. The token persists in `state.json` and the provider config lives in
 Cindy's own database — nothing else to manage.
 
-**Only these three cases need you:**
+**These cases need you:**
 
 1. Qoder login expired → sign in again in the Qoder CN client, then hit **Refresh** in the panel.
 2. Port `47821` taken by something else → the worker falls through to `47822`… and the
    panel's Base URL changes, so update it in Cindy.
 3. Uninstalling and reinstalling the plugin → you'll need to re-enter the provider.
+4. After self-update replaces runtime files → import the complete `.cindy` package through Cindy's native UI to refresh the host installation record.
 
 ## What the panel shows
 
@@ -204,6 +207,17 @@ The AI side can ask too: five tools — `qoder_status`, `qoder_endpoint`, `qoder
 `qoder_checkin`, `qoder_update`. Pass `action=apply` to `qoder_update` to download and
 install.
 
+## Update safety and runtime boundaries
+
+- Updates require a matching, valid **64-hex-digit SHA-256**; size-only fallback is no longer accepted. Downloads require the exact GitHub HTTPS repo / tag / asset, allowlisted redirect domains, at most 5 redirects and a 32 MiB package limit.
+- The installer waits for the old PID to exit and stops without overwriting if it remains alive. After exit, it acquires OS-exclusive locks in the same fixed order, `INSTALL_DIR` (`install`) → `DATA_DIR` (`data`), and holds both throughout installation. After acquiring both locks, the installer validates the attempt identity in `latest-attempt.json`; a late script refuses to copy if the pointer has changed generation or is missing. Each journal attempt / result is persisted. Copy failures trigger rollback, which never overwrites the journal; failed rollback retains diagnostics and backups. `update-status` blocks boot after interrupted copy / rollback; journal `begin` and `applyUpdate` must not overwrite an unrecovered attempt pointer, and `begin` rejects a previous `handed_off` attempt. A pending handoff with no confirmed result blocks a new update: inspect `<install-dir>.updates/install.log` first. Automatic retry is not promised.
+- The persistent update directory is `UPDATE_DIR = canonicalDirectory(INSTALL_DIR) + '.updates'`: `<install-dir>.updates`, a sibling of the canonical install directory, not `update/` in the data directory. Bootstrap, worker and installer all check this journal independently of `DATA_DIR`; changing data directories cannot bypass it, and rollback never overwrites it.
+- **Recovery requires manual journal handling; native import alone does not unblock startup.** Cindy's native full `.cindy` package import does not clear this sibling journal. After interrupted copy / failed rollback, preserve all logs and backups. Import the complete package through Cindy's native UI and confirm success, then disable the plugin, **rename and retain for diagnosis** `<install-dir>.updates/latest-attempt.json`, and re-enable the plugin. Do not delete backups or logs.
+- **Successful self-update means runtime files were replaced, not that Cindy's host installation record was refreshed.** Host installation snapshots are no longer synchronized automatically. The updater neither writes `ghost-install-state` receipts directly nor invokes a sync script through `process.execPath`. Cindy 0.1.128 has no verified public API for plugins to write their own receipts. **Import the complete `.cindy` package using Cindy's native plugin UI** to refresh that record.
+- Manifest `node.entry` is `node/bootstrap.cjs`. It acquires OS-exclusive locks in the fixed order `INSTALL_DIR` (`install`) → `DATA_DIR` (`data`) before loading any business modules / worker. Windows uses named pipes; Linux abstract sockets are for offline CI only, not Linux runtime support. **The same install directory cannot run concurrently even with different data directories; different ports cannot share a data directory either. Multiple instances require both different install directories and different data directories.**
+- Qoder credential reads distinguish `valid`, `absent`, `logged-out` and `temporary`, checking expiry against the current time. Temporary read failure is not logout. Adapter stream errors use the worker's Chinese `formatError` classification, retain received usage and terminate as failure rather than successful completion.
+- Cindy 0.1.128 loads the Node entry through `require`; bootstrap compatibility with that loading method has been verified. This does not mean this round's changes are released or installed. Windows fault tests use real temporary directories, **not an actual plugin installation**. No real-user login / logout testing was performed. Passing tests do not imply bug-free operation or expanded permissions.
+
 ## Where runtime data lives
 
 | Path | Contents |
@@ -212,7 +226,7 @@ install.
 | `%APPDATA%\CindyGlobal\qoder-bridge\state.json` | Local endpoint token + port |
 | `%APPDATA%\CindyGlobal\qoder-bridge\models.json` | Model catalog cache (30 minutes) |
 | `%APPDATA%\CindyGlobal\qoder-bridge\usage.json` | Local usage ledger (per day per model, kept 60 days) |
-| `%APPDATA%\CindyGlobal\qoder-bridge\update\` | Downloaded packages, staging dirs and the replace script |
+| `<install-dir>.updates/` (`UPDATE_DIR`) | Persistent update journal, `latest-attempt.json`, `install.log`, downloaded packages, staging dirs and replace script; sibling of the install directory, independent of the data directory |
 | `%APPDATA%\CindyGlobal\qoder-bridge\bridge.log` | Runtime log, rotates to `.1` past 2 MB |
 
 **Your Qoder token is never written to any of these files** — it's decrypted fresh from
@@ -238,22 +252,32 @@ installed and signed in** (they read real login state and hit the real upstream)
 cd plugin && npm run verify     :: static manifest validation
 cd plugin && npm run pack       :: build the package
 
-node test\host-guard.js         :: Host guard, 13 cases (local, no login)
-node test\responses-status.js   :: Responses status mapping, 19 cases (local, no login)
-node test\upstream-contract.js  :: upstream contract, 16 cases (local: interleaved tool fragments / truncation / usage)
-node test\update-chain.js       :: self-update chain, 52 cases (local: version compare / digest fail-closed / unzip / rollback script)
-node test\review-regressions.js :: past review regressions, 40 cases (local: quota tolerance / error mapping / package identity)
-node test\e2e-package.js        :: package end-to-end, 25 cases (unzip -> start worker -> real chat -> three protocols -> license files)
-node test\e2e-panel.js          :: panel script, 10 cases
-node test\e2e-brain.js          :: panel <-> brain over a real bus, 13 cases
-node test\smoke-protocols.js    :: three protocol shapes, 19 cases
-node test\smoke-tools.js        :: tool calls across three protocols, 11 cases
-node test\wire-quirks.js        :: Cindy's /v1/v1 and [1m] quirks, 10 cases
-node test\features.js           :: check-in / usage / log / price factor / error codes / input validation, 42 cases
+node test\host-guard.js
+node test\responses-status.js
+node test\upstream-contract.js
+node test\update-chain.js
+node test\review-regressions.js
+node test\protocol-defaults-reasoning.js :: protocol defaults and Responses reasoning regression
+node test\bootstrap.js              :: offline: lock before loading business modules
+node test\ownership.js              :: install- and data-directory locks
+node test\update-download.js        :: download restrictions
+node test\update-install-results.js :: installer faults and result persistence
+node test\update-status.js          :: interrupted updates and boot guards
+node test\credential-reading.js     :: credential classification and expiry
+node test\e2e-package.js
+node test\e2e-panel.js
+node test\e2e-brain.js
+node test\smoke-protocols.js
+node test\smoke-tools.js
+node test\wire-quirks.js
+node test\features.js
+node .github\scripts\ci-run.cjs --mode offline :: offline CI orchestration
 ```
 
 To switch models: `node test\smoke-protocols.js <model id>` (defaults to `qfmodel`, free).
-Each test opens its own temp directory and port so it won't collide with a running instance.
+Isolated tests use temporary install copies, temporary data directories and independent ports, sharing neither install nor data directories with running instances. `test/bootstrap.js` is registered as offline and checks that business modules / worker are not loaded before both locks are acquired and that directory conflicts reject startup. It needs no login or real installation and is not actual plugin-installation verification.
+
+This round adds `test/protocol-defaults-reasoning.js`. The code is complete, awaiting final validation, and not released / installed. Use the actual output of `node .github/scripts/ci-run.cjs --mode offline` and the individual commands above for results and counts, not fixed assertion totals. Not run / SKIP does not mean passed.
 
 **Why the tests look like this**: every one of them guards a specific production incident.
 `host-guard` guards against Cindy's proxy stripping the port from the Host header (which
@@ -268,7 +292,7 @@ policy, and pins down that an item status may only be `in_progress` / `completed
 self-update path: that `0.1.15` sorts newer than `0.1.9` (segment-wise, not
 string-wise), that a package whose sha256 doesn't match the release digest is rejected
 before a single byte touches the install directory, and that the generated PowerShell
-waits for the old process, backs up, then syncs Cindy's manifest snapshot.
+waits for the old process, backs up, records the result and rolls back on copy failure. It does not sync Cindy's host installation snapshot.
 
 ## Local endpoint
 
@@ -298,11 +322,7 @@ Auth is `Authorization: Bearer <the token from the panel>`.
   didn't provide it.
 - **Depends on Qoder's internal endpoints.** When upstream changes, the plugin breaks.
   This is not a "long-term stable" thing.
-- **Omitting `stream` returns a streaming response**, the opposite of the three official
-  protocol defaults (non-streaming). This is a deliberate compatibility trade-off: Cindy's
-  Anthropic probe omits `stream` and parses the reply as `text/event-stream`; adopting the
-  official default would make that probe report the endpoint as incompatible. Standard SDKs
-  that want a non-streaming reply should pass `stream: false` explicitly. See issue #15.
+- **Protocol compatibility change in this round (code complete, awaiting final validation, not released / installed):** old issues #15 (stream defaults) and #19 (Responses reasoning) are included in this round's remaining issue scope, not deferred. All three protocols return SSE only for `stream === true`; omitted or `false` returns one JSON response. Upstream may still use `stream: true` and be aggregated. Streaming and non-streaming Responses provide reasoning items containing `summary_text`; streaming uses standard `response.reasoning_summary_part.*` / `response.reasoning_summary_text.*` events. Only actual upstream reasoning and usage are forwarded, never fabricated. Callers relying on the old streaming default must explicitly send `stream: true`. Do not assume these changes are available in the installed release.
 - **A credential format change breaks it.** The proprietary AES wrapper is
   reverse-engineered; if Qoder switches encryption (or rotates the salt), the plugin must
   be updated before it works again.
@@ -332,7 +352,7 @@ To be explicit about the risks:
    quota limits — it circumvents nothing. It spends your own account's quota.
 4. **Login state stays in local memory.** The plugin does not collect or upload your
    token, chat content, or any account information. If you want to audit: there are
-   exactly two outbound domains — `gateway.qoder.com.cn` and `openapi.qoder.com.cn`.
+   account endpoints use `gateway.qoder.com.cn` and `openapi.qoder.com.cn`; update checks also access the GitHub API, and downloads use allowlisted GitHub Release domains.
 5. Runtime logs and a usage ledger stay under `%APPDATA%\CindyGlobal\qoder-bridge\` —
    **read them before sharing**.
 
