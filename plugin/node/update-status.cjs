@@ -20,8 +20,10 @@ function writeResult(attemptDir, result) {
 function readLatest(updateDir) {
   const pointer = join(updateDir, 'latest-attempt.json');
   try {
-    try { fs.statSync(pointer); } catch (error) { if (error.code === 'ENOENT') return null; throw error; }
-    const id = JSON.parse(fs.readFileSync(pointer, 'utf8')).attempt;
+    let pointerText;
+    try { pointerText = fs.readFileSync(pointer, 'utf8'); }
+    catch (error) { if (error.code === 'ENOENT') return null; throw error; }
+    const id = JSON.parse(pointerText).attempt;
     if (typeof id !== 'string' || !/^attempt-[a-f0-9-]+$/.test(id)) throw new Error('Invalid update attempt');
     const resultPath = join(updateDir, id, 'result.json');
     const result = JSON.parse(fs.readFileSync(resultPath, 'utf8'));

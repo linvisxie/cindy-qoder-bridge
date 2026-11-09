@@ -44,6 +44,13 @@ test('an invalid or unreadable journal cannot silently become success', () => {
   fs.writeFileSync(path.join(root, 'latest-attempt.json'), JSON.stringify({ attempt: '../outside' }));
   assert.equal(status.readLatest(root).status, 'unknown');
 });
+test('journal read uses the open result, not a separate filesystem precheck', () => {
+  const root = fixture(); status.begin(root, 'attempt-abc');
+  const original = fs.statSync;
+  fs.statSync = () => { throw new Error('unexpected TOCTOU precheck'); };
+  try { assert.equal(status.readLatest(root).status, 'preparing'); }
+  finally { fs.statSync = original; }
+});
 test('a pending handoff cannot be superseded by a new attempt', () => {
   const root = fixture(); const p = status.begin(root, 'attempt-abc');
   status.writeResult(p, { status: 'handed_off', phase: 'waiting' });
