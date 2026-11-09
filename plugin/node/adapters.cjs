@@ -156,7 +156,7 @@ function anthropicRequestToChat(body) {
     messages,
     tools,
     maxTokens: Number.isSafeInteger(body && body.max_tokens) ? body.max_tokens : undefined,
-    stream: !(body && body.stream === false),
+    stream: !!(body && body.stream === true),
     thinking: !!(body && body.thinking && body.thinking.type === 'enabled'),
   };
 }
@@ -277,7 +277,18 @@ async function writeAnthropicStream(res, first, iterator, opts) {
     res.end();
   } catch (e) {
     if (opts) opts.usage = usage;
-    send({ type: 'error', error: { type: 'api_error', message: e.message } });
+    const mapped = opts && typeof opts.formatError === 'function' ? opts.formatError(e) : null;
+    // Anthropic 的 type 使用协议分类；保留 worker 的业务分类到 code，避免把额度用尽说成网络故障。
+    const type = Number(e.status) === 429 ? 'rate_limit_error'
+      : Number(e.status) === 401 ? 'authentication_error'
+      : Number(e.status) === 403 ? 'permission_error'
+      : Number(e.status) === 400 ? 'invalid_request_error' : 'api_error';
+    send({ type: 'error', error: {
+      type,
+      message: mapped?.message || e.message,
+      ...(mapped?.type ? { code: mapped.type } : {}),
+      ...(mapped?.retry_after_seconds !== undefined ? { retry_after_seconds: mapped.retry_after_seconds } : {}),
+    } });
     res.end();
   }
 }
@@ -435,7 +446,7 @@ function responsesRequestToChat(body) {
     messages,
     tools,
     maxTokens: Number.isSafeInteger(body && body.max_output_tokens) ? body.max_output_tokens : undefined,
-    stream: !(body && body.stream === false),
+    stream: !!(body && body.stream === true),
     reasoningEffort: effort,
   };
 }
@@ -547,6 +558,9 @@ async function writeResponsesStream(res, first, iterator, opts) {
   let nextIndex = 0;
   let msgIndex = null;
   let msgAdded = false;
+  const reasoningItemId = 'rs_' + randomBytes(12).toString('hex');
+  let reasoningIndex = null;
+  let reasoning = '';
   let text = '';
   const callIndex = new Map();
   const calls = new Map();
@@ -570,6 +584,17 @@ async function writeResponsesStream(res, first, iterator, opts) {
       if (!ch) continue;
       const d = ch.delta || ch.message || {};
       if (typeof ch.finish_reason === 'string') { finish = ch.finish_reason; sawFinish = true; }
+
+      const r = d.reasoning_content ?? d.reasoning;
+      if (typeof r === 'string' && r) {
+        if (reasoningIndex === null) {
+          reasoningIndex = nextIndex++;
+          send({ type: 'response.output_item.added', output_index: reasoningIndex, item: { id: reasoningItemId, type: 'reasoning', status: 'in_progress', summary: [] } });
+          send({ type: 'response.reasoning_summary_part.added', item_id: reasoningItemId, output_index: reasoningIndex, summary_index: 0, part: { type: 'summary_text', text: '' } });
+        }
+        reasoning += r;
+        send({ type: 'response.reasoning_summary_text.delta', item_id: reasoningItemId, output_index: reasoningIndex, summary_index: 0, delta: r });
+      }
 
       if (typeof d.content === 'string' && d.content) {
         ensureMessage();
@@ -615,6 +640,14 @@ async function writeResponsesStream(res, first, iterator, opts) {
     // 子项（message / function_call）的状态跟随整体：截断了就不该标 completed
     const itemStatus = state.status === 'completed' ? 'completed' : 'incomplete';
     const output = [];
+    if (reasoningIndex !== null) {
+      const part = { type: 'summary_text', text: reasoning };
+      send({ type: 'response.reasoning_summary_text.done', item_id: reasoningItemId, output_index: reasoningIndex, summary_index: 0, text: reasoning });
+      send({ type: 'response.reasoning_summary_part.done', item_id: reasoningItemId, output_index: reasoningIndex, summary_index: 0, part });
+      const item = { id: reasoningItemId, type: 'reasoning', status: itemStatus, summary: [part] };
+      send({ type: 'response.output_item.done', output_index: reasoningIndex, item });
+      output.push({ index: reasoningIndex, item });
+    }
     if (msgAdded) {
       send({ type: 'response.output_text.done', item_id: msgItemId, output_index: msgIndex, content_index: 0, text });
       send({ type: 'response.content_part.done', item_id: msgItemId, output_index: msgIndex, content_index: 0, part: { type: 'output_text', text, annotations: [] } });
@@ -640,13 +673,20 @@ async function writeResponsesStream(res, first, iterator, opts) {
     res.end();
   } catch (e) {
     if (opts) opts.usage = usage;
-    send({ type: 'response.failed', response: { ...base(), status: 'failed', error: { code: 'upstream_error', message: e.message } } });
+    const mapped = opts && typeof opts.formatError === 'function' ? opts.formatError(e) : null;
+    send({ type: 'response.failed', response: {
+      ...base(), status: 'failed',
+      usage: usage ? responsesUsage(usage, opts.inputTokens) : null,
+      error: { code: mapped?.type || 'upstream_error', message: mapped?.message || e.message },
+    } });
     res.end();
   }
 }
 
 async function responsesMessage(first, iterator, opts) {
   let text = '';
+  let reasoning = '';
+  const order = [];
   const calls = new Map();
   let finish = 'stop';
   let sawFinish = false;
@@ -659,10 +699,19 @@ async function responsesMessage(first, iterator, opts) {
     if (!ch) continue;
     const d = ch.delta || ch.message || {};
     if (typeof ch.finish_reason === 'string') { finish = ch.finish_reason; sawFinish = true; }
-    if (typeof d.content === 'string') text += d.content;
+    const r = d.reasoning_content ?? d.reasoning;
+    if (typeof r === 'string' && r) {
+      if (!reasoning) order.push({ type: 'reasoning' });
+      reasoning += r;
+    }
+    if (typeof d.content === 'string' && d.content) {
+      if (!text) order.push({ type: 'message' });
+      text += d.content;
+    }
     if (Array.isArray(d.tool_calls)) {
       for (const t of d.tool_calls) {
         const key = t.index ?? 0;
+        if (!calls.has(key)) order.push({ type: 'function_call', key });
         const cur = calls.get(key) || { id: '', callId: '', name: '', args: '' };
         if (t.id) cur.callId = String(t.id);
         if (t.function && typeof t.function.name === 'string' && t.function.name) cur.name = t.function.name;
@@ -678,20 +727,28 @@ async function responsesMessage(first, iterator, opts) {
   const state = responsesStatusOf(finish);
   const itemStatus = state.status === 'completed' ? 'completed' : 'incomplete';
   const output = [];
-  if (text) {
-    output.push({
-      id: 'msg_' + randomBytes(12).toString('hex'),
-      type: 'message', status: itemStatus, role: 'assistant',
-      content: [{ type: 'output_text', text, annotations: [] }],
-    });
-  }
-  for (const c of calls.values()) {
-    output.push({
-      id: 'fc_' + randomBytes(10).toString('hex'),
-      type: 'function_call', status: itemStatus,
-      call_id: c.callId || 'call_' + randomBytes(8).toString('hex'),
-      name: c.name, arguments: c.args,
-    });
+  for (const entry of order) {
+    if (entry.type === 'reasoning') {
+      output.push({
+        id: 'rs_' + randomBytes(12).toString('hex'),
+        type: 'reasoning', status: itemStatus,
+        summary: [{ type: 'summary_text', text: reasoning }],
+      });
+    } else if (entry.type === 'message') {
+      output.push({
+        id: 'msg_' + randomBytes(12).toString('hex'),
+        type: 'message', status: itemStatus, role: 'assistant',
+        content: [{ type: 'output_text', text, annotations: [] }],
+      });
+    } else {
+      const c = calls.get(entry.key);
+      output.push({
+        id: 'fc_' + randomBytes(10).toString('hex'),
+        type: 'function_call', status: itemStatus,
+        call_id: c.callId || 'call_' + randomBytes(8).toString('hex'),
+        name: c.name, arguments: c.args,
+      });
+    }
   }
 
   return {

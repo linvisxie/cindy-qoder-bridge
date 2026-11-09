@@ -30,7 +30,7 @@ try {
 }
 
 // ---- 2. 结构 ----
-const MUST = ['ghost.json', 'main.js', 'panel.html', 'panel.js', join('node', 'worker.cjs'), join('node', 'adapters.cjs'), join('node', 'update.cjs')];
+const MUST = ['ghost.json', 'main.js', 'panel.html', 'panel.js', ...['bootstrap', 'worker', 'adapters', 'update', 'ownership', 'download', 'update-status'].map(name => join('node', name + '.cjs'))];
 for (const rel of MUST) {
   if (existsSync(join(work, rel))) ok(`包含 ${rel}`);
   else bad(`缺少 ${rel}`);
@@ -64,7 +64,7 @@ const port = 47871;
 const dataDir = join(work, '_e2e-data');
 mkdirSync(dataDir, { recursive: true });
 
-const child = spawn(process.execPath, [join(work, 'node', 'worker.cjs')], {
+const child = spawn(process.execPath, [join(work, manifest.node.entry)], {
   cwd: work,
   env: { ...process.env, CINDY_QODER_DATA: dataDir, CINDY_QODER_PORT: String(port) },
   stdio: ['pipe', 'pipe', 'pipe'],

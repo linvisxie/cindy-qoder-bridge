@@ -21,10 +21,22 @@ function worker(options = {}) {
   const baseRequire = createRequire(file);
   const dir = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'bridge-review-'));
   temporary.push(dir);
-  const launches = [], exits = [];
+  const launches = [], exits = [], ownershipCalls = [];
+  const owner = {
+    held: true,
+    assertHeld() { if (!this.held) throw new Error('fixture ownership lost'); },
+  };
+  const installation = { ...owner };
   const ctx = vm.createContext({
+    __CINDY_BRIDGE_OWNERSHIP: options.unowned ? undefined : { installation, data: owner },
     __dirname: path.dirname(file), Buffer, URL, TextDecoder, AbortController, AbortSignal,
+    fetch: async () => { throw new Error('unexpected fixture fetch'); },
     require(id) {
+      if (id === './update-status.cjs') return { ...baseRequire(id), updateDirectory: () => path.join(dir, 'update') };
+      if (id === './ownership.cjs') return { pipeName: (_directory, scope = 'data') => '\\\\.\\pipe\\fixture-' + scope, async acquireOwnership(directory) {
+        ownershipCalls.push(directory);
+        throw new Error('worker must not acquire ownership');
+      } };
       if (id === 'node:http' && options.http) return options.http;
       if (id === 'node:fs' && options.fs) return { ...baseRequire(id), ...options.fs };
       if (id === './trae.cjs' && options.trae) return options.trae;
@@ -40,7 +52,7 @@ function worker(options = {}) {
       return baseRequire(id);
     },
     process: {
-      env: { ...process.env, CINDY_QODER_DATA: dir, CINDY_TRAE_DATA: dir },
+      env: { ...process.env, APPDATA: dir, LOCALAPPDATA: dir, USERPROFILE: dir, HOME: dir, CINDY_QODER_DATA: dir, CINDY_TRAE_DATA: dir },
       stderr: { write() {} }, platform: process.platform, arch: process.arch,
       pid: process.pid, execPath: process.execPath, exit() { throw new Error('test must not exit worker'); },
     },
@@ -49,8 +61,50 @@ function worker(options = {}) {
   });
   // Retain the real implementation, omit resident boot and stdio event registration.
   vm.runInContext(fs.readFileSync(file, 'utf8').split('// JSON-RPC over stdio')[0], ctx, { filename: file });
-  return { ctx, dir, launches, exits, run: (source) => vm.runInContext(source, ctx) };
+  vm.runInContext("loadCredential=async()=>({status:'absent'})", ctx);
+  return { ctx, dir, launches, exits, owner, installation, ownershipCalls, run: (source) => vm.runInContext(source, ctx) };
 }
+
+test('worker requires both bootstrap owners and never acquires ownership itself', async () => {
+  const w = worker();
+  await Promise.all([w.run('ensureOwnership()'), w.run('ensureOwnership()')]);
+  assert.deepEqual(w.ownershipCalls, []);
+  w.run('saveState({fixture:true})');
+  for (const owner of [w.installation, w.owner]) {
+    owner.held = false;
+    await assert.rejects(w.run('ensureOwnership()'), /ownership|required|lost/i);
+    assert.throws(() => w.run('saveState({fixture:false})'), /ownership|required|lost/i);
+    owner.held = true;
+    const heldAssertion = owner.assertHeld;
+    owner.assertHeld = () => { throw new Error('fixture ownership lost'); };
+    await assert.rejects(w.run('ensureOwnership()'), /ownership lost/);
+    owner.assertHeld = heldAssertion;
+  }
+  assert.equal(JSON.parse(fs.readFileSync(path.join(w.dir, 'state.json'))).fixture, true);
+  assert.throws(() => worker({ unowned: true }), /bootstrap|ownership|required/i);
+  const denied = worker();
+  denied.installation.held = false;
+  assert.throws(() => denied.run('saveState({fixture:true})'), /ownership|required|lost/i);
+  denied.run("refreshCredential=async()=>{throw Error('must not read credentials')};startServer=async()=>{throw Error('must not listen')}");
+  await assert.rejects(denied.run('boot()'), /ownership|required|lost/i);
+  assert.deepEqual(denied.ownershipCalls, []);
+  assert.deepEqual(fs.readdirSync(denied.dir), []);
+  assert.equal(denied.launches.length, 0);
+});
+
+test('Qoder credential result contract distinguishes logout from temporary failure', async () => {
+  for (const status of ['absent', 'logged-out', 'temporary']) {
+    const w = worker();
+    w.run("loadCredential=async()=>({status:'valid',credential:{token:'fixture',expiresAt:Date.now()+3600000}})");
+    assert.equal((await w.run('refreshCredential(true)')).token, 'fixture');
+    const timestamp = w.run('credentialAt');
+    w.ctx.resultStatus = status;
+    w.run('loadCredential=async()=>({status:resultStatus})');
+    const result = await w.run('refreshCredential(true)');
+    assert.equal(result?.token, status === 'temporary' ? 'fixture' : undefined);
+    assert.equal(w.run('credentialAt'), status === 'temporary' ? timestamp : 0);
+  }
+});
 
 async function request(w, route, body, auth = 'local-test') {
   const req = Readable.from([Buffer.from(JSON.stringify(body))]);
@@ -89,10 +143,10 @@ for (const input of [123, 0]) for (const route of ['/v1/messages', '/v1/response
 
 const validManifest = { ...MANIFEST, version: '99.0.0' };
 function entries(manifest = validManifest) {
-  return ['ghost.json', 'main.js', 'panel.js', 'panel.html', 'node/worker.cjs', 'node/adapters.cjs', 'node/update.cjs', ...(IS_TRAE ? ['node/trae.cjs'] : [])]
+  return ['ghost.json', 'main.js', 'panel.js', 'panel.html', 'node/worker.cjs', 'node/bootstrap.cjs', 'node/adapters.cjs', 'node/update.cjs', 'node/ownership.cjs', 'node/download.cjs', 'node/update-status.cjs', ...(IS_TRAE ? ['node/trae.cjs'] : [])]
     .map(name => ({ name, data: Buffer.from(name === 'ghost.json' ? JSON.stringify(manifest) : 'fixture') }));
 }
-const expected = { id: MANIFEST.id, version: '99.0.0', currentVersion: MANIFEST.version, required: ['node/adapters.cjs', 'node/update.cjs', ...(IS_TRAE ? ['node/trae.cjs'] : [])] };
+const expected = { id: MANIFEST.id, version: '99.0.0', currentVersion: MANIFEST.version, required: ['node/bootstrap.cjs', 'node/adapters.cjs', 'node/update.cjs', 'node/ownership.cjs', 'node/download.cjs', 'node/update-status.cjs', ...(IS_TRAE ? ['node/trae.cjs'] : [])] };
 // Small ZIP writer for controlled updater fixtures (stored entries, valid CRC).
 function zip(list) {
   const local = [], central = []; let offset = 0;
@@ -111,10 +165,81 @@ function zip(list) {
   return Buffer.concat([...local,cd,end]);
 }
 function prepareUpdate(w, list) {
-  const bytes = zip(list); w.ctx.fetch = async () => ({ ok: true, arrayBuffer: async () => bytes });
-  w.ctx.asset = { name: 'fixture.cindy', url: 'https://invalid.example/fixture', size: bytes.length, digest: 'sha256:' + crypto.createHash('sha256').update(bytes).digest('hex') };
+  const bytes = zip(list);
+  const name = IS_TRAE ? 'trae-cindy-bridge.cindy' : 'cindy-qoder-bridge.cindy';
+  const url = `https://github.com/${w.run('UPDATE_REPO')}/releases/download/v99.0.0/${name}`;
+  w.ctx.fetch = async (requested, options) => {
+    assert.equal(requested, url); assert.equal(options.redirect, 'manual');
+    return new Response(bytes, { headers: { 'Content-Length': String(bytes.length) } });
+  };
+  w.ctx.asset = { name, url, size: bytes.length, digest: 'sha256:' + crypto.createHash('sha256').update(bytes).digest('hex') };
   w.run(`checkUpdate=async()=>({current:'${MANIFEST.version}',latest:'99.0.0',hasUpdate:true,asset})`);
 }
+
+for (const field of ['digest', 'size']) test(`update rejects incorrect ${field} before installer launch`, async () => {
+  const w = worker(); prepareUpdate(w, entries());
+  w.ctx.asset[field] = field === 'digest' ? 'sha256:' + '0'.repeat(64) : w.ctx.asset.size + 1;
+  await assert.rejects(w.run('applyUpdate()'));
+  assert.equal(w.launches.length, 0); assert.equal(w.exits.length, 0);
+});
+
+test('update recovery blocks unsafe journals before boot and permits safe outcomes', async () => {
+  const journal = require('../plugin/node/update-status.cjs');
+  for (const [status, phase, blocked] of [
+    ['rollback_failed','rolling_back',true], ['in_progress','copying',true],
+    ['in_progress','rolling_back',true], ['not_started','failed',false],
+    ['handed_off','waiting',false], ['rollback_succeeded','complete',false], ['success','complete',false],
+  ]) {
+    const w = worker(), dir = path.join(w.dir, 'update');
+    const attempt = journal.begin(dir, 'attempt-abc');
+    journal.writeResult(attempt, {status, phase});
+    w.run("actualPort=1;refreshCredential=async()=>{throw Error('unexpected credential read')}");
+    if (blocked) await assert.rejects(w.run('boot()'), /Cindy.*result\.json/);
+    else await w.run('boot()');
+    assert.equal(journal.readLatest(dir).status, status);
+  }
+  const w = worker(), dir = path.join(w.dir, 'update');
+  const attempt = journal.begin(dir, 'attempt-abc');
+  fs.writeFileSync(path.join(attempt, 'result.json'), 'broken JSON');
+  assert.equal(journal.readLatest(dir).status, 'unknown');
+  await assert.rejects(w.run('boot()'), /Cindy/);
+});
+
+for (const [status, phase] of [
+  ['in_progress', 'copying'], ['in_progress', 'rolling_back'],
+  ['rollback_failed', 'rolling_back'], ['unknown', 'unreadable'],
+]) test(`applyUpdate preserves unresolved ${status}/${phase} journal before any new attempt`, async () => {
+  const journal = require('../plugin/node/update-status.cjs');
+  const w = worker(), dir = path.join(w.dir, 'update');
+  const attempt = journal.begin(dir, 'attempt-abc');
+  journal.writeResult(attempt, { status, phase });
+  if (status === 'unknown') fs.writeFileSync(path.join(attempt, 'result.json'), 'broken JSON');
+  const pointer = fs.readFileSync(path.join(dir, 'latest-attempt.json'));
+  const result = fs.readFileSync(path.join(attempt, 'result.json'));
+  const contents = fs.readdirSync(dir).sort();
+  w.run("checkUpdate=async()=>{throw Error('must not check releases before recovery')}");
+  await assert.rejects(w.run('applyUpdate()'), /Cindy/);
+  assert.deepEqual(fs.readFileSync(path.join(dir, 'latest-attempt.json')), pointer);
+  assert.deepEqual(fs.readFileSync(path.join(attempt, 'result.json')), result);
+  assert.deepEqual(fs.readdirSync(dir).sort(), contents);
+  assert.equal(w.launches.length, 0); assert.equal(w.exits.length, 0);
+});
+
+test('applyUpdate preserves pending handed_off journal without launching another installer', async () => {
+  const journal = require('../plugin/node/update-status.cjs');
+  const w = worker(), dir = path.join(w.dir, 'update');
+  prepareUpdate(w, entries());
+  const attempt = journal.begin(dir, 'attempt-abc');
+  journal.writeResult(attempt, { status: 'handed_off', phase: 'waiting' });
+  const pointer = fs.readFileSync(path.join(dir, 'latest-attempt.json'));
+  const result = fs.readFileSync(path.join(attempt, 'result.json'));
+  const contents = fs.readdirSync(dir).sort();
+  await assert.rejects(w.run('applyUpdate()'), /安装器|交接|pending|handed.off/i);
+  assert.deepEqual(fs.readFileSync(path.join(dir, 'latest-attempt.json')), pointer);
+  assert.deepEqual(fs.readFileSync(path.join(attempt, 'result.json')), result);
+  assert.deepEqual(fs.readdirSync(dir).sort(), contents);
+  assert.equal(w.launches.length, 0); assert.equal(w.exits.length, 0);
+});
 
 test('valid package belongs to this plugin', () => { assert.equal(updater.validatePackage(entries(), expected).id, MANIFEST.id); });
 for (const [label, alter] of [
@@ -123,6 +248,8 @@ for (const [label, alter] of [
   ['non-JSON manifest', () => entries().map(e => e.name === 'ghost.json' ? { ...e, data: Buffer.from('not JSON') } : e)],
   ['missing main', () => entries().filter(e => e.name !== 'main.js')],
   ['missing worker', () => entries().filter(e => e.name !== 'node/worker.cjs')],
+  ['missing bootstrap', () => entries().filter(e => e.name !== 'node/bootstrap.cjs')],
+  ['missing owner', () => entries().filter(e => e.name !== 'node/ownership.cjs')],
   ['invalid declared entry', () => entries({ ...validManifest, entry: '../outside.js' })],
 ]) {
   test(`updater refuses ${label} before launching installer`, async () => {
@@ -136,12 +263,29 @@ for (const code of ['ENOENT', 'EACCES']) test(`installer ${code} leaves worker r
   await assert.rejects(w.run('applyUpdate()'), new RegExp(code));
   assert.equal(w.launches.length, 1); assert.equal(w.exits.length, 0);
   assert.equal(w.run('updateInFlight'), false);
-  assert.deepEqual(fs.readdirSync(path.join(w.dir, 'update')), []);
+  const updateDir = path.join(w.dir, 'update');
+  const journal = require('../plugin/node/update-status.cjs').readLatest(updateDir);
+  assert.equal(journal.status, 'not_started'); assert.equal(journal.phase, 'failed');
+  assert.match(journal.error, new RegExp(code));
+  assert.equal(journal.hostReceipt, 'requires_host_install');
+  assert.ok(!fs.readdirSync(updateDir).some(name => name.startsWith('stage-')));
 });
 test('successful spawn keeps update locked until worker exits', async () => {
   const w = worker(); prepareUpdate(w, entries());
-  const first = await w.run('applyUpdate()'), second = await w.run('applyUpdate()');
+  const first = await w.run('applyUpdate()');
+  const pointerPath = path.join(w.dir, 'update', 'latest-attempt.json');
+  const pointer = fs.readFileSync(pointerPath);
+  const second = await w.run('applyUpdate()');
   assert.equal(first.applied, true); assert.equal(second.applied, false);
+  assert.deepEqual(fs.readFileSync(pointerPath), pointer);
+  const script = fs.readFileSync(first.scriptPath, 'utf8');
+  assert.ok(script.includes("$installationPipe = '\\\\.\\pipe\\fixture-install'"));
+  assert.ok(script.includes("$ownershipPipe = '\\\\.\\pipe\\fixture-data'"));
+  assert.ok(script.includes('$latestPointer = ' + updater.psQuote(path.join(w.dir, 'update', 'latest-attempt.json'))));
+  const result = JSON.parse(fs.readFileSync(first.resultPath));
+  assert.equal(result.status, 'handed_off'); assert.equal(result.phase, 'waiting');
+  assert.equal(result.hostReceipt, 'requires_host_install');
+  assert.match(first.backup, /\.bak-.*-attempt-[a-f0-9-]+$/);
   assert.equal(w.exits.length, 1); assert.equal(w.launches.length, 1);
   assert.equal(w.run('updateInFlight'), true);
 });
@@ -528,12 +672,12 @@ test('malformed quota numbers retain stale values while missing numbers are deri
 
 
 test('late credential refresh cannot clear or overwrite a newer successful result', async () => {
-  for (const late of [undefined, {token:'old'}]) {
+  for (const late of [{status:'absent'}, {status:'logged-out'}, {status:'temporary'}, {status:'valid',credential:{token:'old'}}]) {
     const w = worker();
     w.run('globalThis.pending=[];loadCredential=()=>new Promise(resolve=>pending.push(resolve))');
     const old = w.run('refreshCredential(true)');
     const recent = w.run('refreshCredential(true)');
-    w.run("pending[1]({token:'new'})"); await recent;
+    w.run("pending[1]({status:'valid',credential:{token:'new'}})"); await recent;
     const timestamp = w.run('credentialAt');
     w.ctx.late = late;
     w.run('pending[0](late)'); await old;
@@ -564,6 +708,33 @@ test('generation and token-count routes validate required input after auth befor
     ['/v1/responses',{input:'hi'}],
     ['/v1/responses',{input:[{type:'function_call_output',call_id:'call_a',output:'done'}]}],
   ]) assert.equal((await request(w,route,{model:'test',stream:false,...body})).status,200,route);
+});
+
+test('worker stream errors use real Qoder classifications without exposing raw messages and retain usage', async () => {
+  for (const [upstreamCode, status, kind] of [['105',401,'auth_expired'], ['110',402,'daily_limit'], ['10605',429,'rate_limit'], ['429',429,'rate_limit']]) {
+    for (const route of ['/v1/messages', '/v1/responses']) {
+      const w = worker();
+      w.run(`token='local-test';refreshCredential=async()=>({token:'fixture'});
+        streamChat=async function*(){
+          yield {choices:[{delta:{content:'partial'}}],usage:{prompt_tokens:20,completion_tokens:3}};
+          throw Object.assign(new Error('raw upstream secret message'),{status:${status},upstreamCode:'${upstreamCode}'});
+        }`);
+      const body = route.endsWith('messages') ? {messages:[{role:'user',content:'hi'}]} : {input:'hi'};
+      const res = await request(w,route,{model:'test',stream:true,...body});
+      assert.equal(res.status,200);
+      const events = res.text.split('\n').filter(s=>s.startsWith('data: ')).map(s=>JSON.parse(s.slice(6)));
+      const terminal = events.filter(e=>e.type==='error'||e.type==='response.failed');
+      assert.equal(terminal.length,1);
+      const error = terminal[0].error || terminal[0].response.error;
+      assert.equal(error.code,kind); assert.match(error.message,/[\u4e00-\u9fff]/);
+      assert.ok(!res.text.includes('raw upstream secret message'));
+      assert.ok(!events.some(e=>e.type==='message_stop'||e.type==='response.completed'));
+      if (route.endsWith('responses')) assert.equal(terminal[0].response.usage.input_tokens,20);
+      const book = JSON.parse(fs.readFileSync(path.join(w.dir,'usage.json')));
+      const stats = Object.values(book.days)[0].models.test;
+      assert.equal(stats.in,20); assert.equal(stats.out,3);
+    }
+  }
 });
 
 test('Host authority rejects suffixes, invalid octets and invalid ports', () => {

@@ -158,6 +158,39 @@ function sseEvents(res, type) { return res.events.filter((e) => e.type === type)
     ok('Responses 流回传 usage', opts.usage && opts.usage.completion_tokens === 5, JSON.stringify(opts.usage));
   }
 
+  console.log('--- 流中错误复用 worker 分类，保留已收 usage 且不正常收尾 ---');
+  for (const [status, upstreamCode, kind, message] of [
+    [402, '4008', 'hard_credit', 'SOLO 额度已用尽'],
+    [402, '4222', 'hard_credit', '企业租户额度已用尽'],
+    [429, '4011', 'rate_limit', '上游限流，请稍后重试'],
+    [401, '1001', 'auth', '登录已过期，请重新登录'],
+  ]) {
+    for (const wire of ['anthropic', 'responses']) {
+      const res = fakeRes();
+      const usage = { prompt_tokens: 20, completion_tokens: 3 };
+      const error = Object.assign(new Error('raw upstream secret message'), { status, upstreamCode });
+      const opts = { ...OPTS, formatError: (e) => {
+        if (e !== error) throw new Error('未传回原始错误');
+        return { type: kind, message, ...(status === 429 ? { retry_after_seconds: 30 } : {}) };
+      } };
+      const first = { done: false, value: { usage, choices: [{ delta: { content: '部分内容' }, finish_reason: null }] } };
+      const iterator = { async next() { throw error; } };
+      if (wire === 'anthropic') await adapters.writeAnthropicStream(res, first, iterator, opts);
+      else await adapters.writeResponsesStream(res, first, iterator, opts);
+      const terminal = res.events.filter((e) => e.type === 'error' || e.type === 'response.failed');
+      const data = terminal[0]?.data;
+      const reported = wire === 'anthropic' ? data?.error : data?.response?.error;
+      ok(`${wire} ${upstreamCode}：只发一个失败事件且不含原始错误`, terminal.length === 1
+        && reported?.message === message && reported?.code === kind
+        && !JSON.stringify(terminal).includes('raw upstream secret message'));
+      ok(`${wire} ${upstreamCode}：真实 usage 留给账本`, opts.usage === usage);
+      ok(`${wire} ${upstreamCode}：不发成功收尾`, !res.events.some((e) => e.type === 'response.completed' || e.type === 'message_stop'));
+      if (wire === 'anthropic' && status === 429) ok('Anthropic 限流：合法 type 与重试时间',
+        reported?.type === 'rate_limit_error' && reported?.retry_after_seconds === 30);
+      if (wire === 'responses') ok(`Responses ${upstreamCode}：失败响应仍附已收用量`, data?.response?.usage?.input_tokens === 20);
+    }
+  }
+
   console.log('--- 第 6 项：包里必须带许可与第三方声明（由 e2e-package 校验，这里只记位置） ---');
   skip('打包清单含 LICENSE / NOTICE / THIRD-PARTY-NOTICES.md', '见 test/e2e-package.js');
 

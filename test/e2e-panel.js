@@ -10,7 +10,7 @@ const os = require('node:os');
 const vm = require('node:vm');
 
 const ROOT = join(__dirname, '..');
-const WORKER = join(ROOT, 'plugin', 'node', 'worker.cjs');
+const WORKER = join(ROOT, 'plugin', 'node', 'bootstrap.cjs');
 const PANEL_JS = join(ROOT, 'plugin', 'panel.js');
 
 // ---------- 1. 拿真实 status ----------

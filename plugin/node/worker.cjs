@@ -3,6 +3,11 @@
 // stdout 只能写协议消息，日志一律写 stderr。
 'use strict';
 
+const bootstrapOwners = globalThis.__CINDY_BRIDGE_OWNERSHIP;
+if (!bootstrapOwners?.installation?.held || !bootstrapOwners?.data?.held) {
+  throw new Error('必须通过 node/bootstrap.cjs 取得安装目录和数据目录独占权后启动。');
+}
+
 const crypto = require('node:crypto');
 const http = require('node:http');
 const os = require('node:os');
@@ -15,6 +20,9 @@ const { execFile } = require('node:child_process');
 const { spawn } = require('node:child_process');
 const adapters = require('./adapters.cjs');
 const updater = require('./update.cjs');
+const { pipeName } = require('./ownership.cjs');
+const download = require('./download.cjs');
+const updateStatus = require('./update-status.cjs');
 
 // ============================================================
 // 协议层（移植自 @eghrhegpe/dsh-connect-qoder 0.7.6，MIT）
@@ -217,19 +225,22 @@ function machineIdFor(appDir) {
   return 'cindy-qoder-bridge';
 }
 
-function loadNewCredential(region, appDir, key) {
-  const file = join(appDir, 'auth.v1.dat');
-  if (!existsSync(file)) return undefined;
-  const plain = decryptOscrypt(readFileSync(file), key);
-  if (plain === undefined) return undefined;
+function loadNewCredential(region, appDir, key, blob) {
+  try { blob ??= readFileSync(join(appDir, 'auth.v1.dat')); }
+  catch (error) { return { status: error.code === 'ENOENT' ? 'absent' : 'temporary' }; }
+  const plain = decryptOscrypt(blob, key);
+  if (plain === undefined) return { status: 'temporary' };
   let s;
-  try { s = JSON.parse(plain); } catch { return undefined; }
-  if (!s || typeof s !== 'object') return undefined;
-  if (typeof s.token !== 'string' || s.token.length === 0) return undefined;
+  try { s = JSON.parse(plain); } catch { return { status: 'temporary' }; }
+  // Only a successfully decrypted explicit empty token is logout evidence.
+  // Missing fields / wrong shapes may be a partially-written or newer schema.
+  if (s === null || (s && typeof s === 'object' && Object.hasOwn(s, 'token') && (s.token === '' || s.token === null))) return { status: 'logged-out' };
+  if (!s || typeof s !== 'object' || Array.isArray(s)) return { status: 'temporary' };
+  if (typeof s.token !== 'string' || s.token.length === 0) return { status: 'temporary' };
   const u = s.user && typeof s.user === 'object' ? s.user : {};
-  if (typeof u.id !== 'string' || u.id.length === 0) return undefined;
+  if (typeof u.id !== 'string' || u.id.length === 0) return { status: 'temporary' };
   const exp = Date.parse(String(s.expiresAt));
-  return {
+  return { status: 'valid', credential: {
     region: region.id,
     userID: u.id,
     name: typeof u.name === 'string' ? u.name : '',
@@ -238,20 +249,29 @@ function loadNewCredential(region, appDir, key) {
     expiresAt: Number.isFinite(exp) ? exp : 0,
     expired: Number.isFinite(exp) && exp > 0 ? exp <= Date.now() : false,
     machineID: machineIdFor(appDir),
-  };
+  } };
 }
 
 async function loadCredential(region) {
   const root = appDataRoot();
+  let temporary = false;
+  let loggedOut = false;
   for (const appName of region.appNames) {
     const appDir = join(root, appName);
-    if (!existsSync(appDir)) continue;
-    const key = await oscryptKeyFor(appDir);
-    if (key === undefined) continue;
-    const cred = loadNewCredential(region, appDir, key);
-    if (cred !== undefined) return cred;
+    let blob;
+    try { blob = readFileSync(join(appDir, 'auth.v1.dat')); }
+    catch (error) { if (error.code !== 'ENOENT') temporary = true; continue; }
+    try {
+      // Absent auth is definitive even without Local State / a DPAPI key.
+      const key = await oscryptKeyFor(appDir);
+      if (key === undefined) { temporary = true; continue; }
+      const result = loadNewCredential(region, appDir, key, blob);
+      if (result.status === 'valid') return result;
+      if (result.status === 'temporary') temporary = true;
+      if (result.status === 'logged-out') loggedOut = true;
+    } catch { temporary = true; }
   }
-  return undefined;
+  return { status: temporary ? 'temporary' : loggedOut ? 'logged-out' : 'absent' };
 }
 
 function modelListUrl(region) { return `${region.baseUrl}algo/api/v2/model/list?Encode=1`; }
@@ -346,6 +366,15 @@ function toQoderTools(tools) {
 const DATA_DIR = process.env.CINDY_QODER_DATA || join(os.homedir(), 'AppData', 'Roaming', 'CindyGlobal', 'qoder-bridge');
 const PREFERRED_PORT = Number(process.env.CINDY_QODER_PORT || 47821);
 const STATE_FILE = join(DATA_DIR, 'state.json');
+const dataOwnership = bootstrapOwners.data;
+async function ensureOwnership() {
+  assertOwnership();
+  return dataOwnership;
+}
+function assertOwnership() {
+  bootstrapOwners.installation.assertHeld();
+  dataOwnership.assertHeld();
+}
 
 let region = REGIONS[0];
 let credential;
@@ -387,6 +416,7 @@ const MAX_BODY_BYTES = 20 * 1024 * 1024;
 // Cindy 只把 node worker 的 stderr 挂到自己那儿，重启就没了。这里同时落一份盘，
 // 出问题能翻历史；超过 2MB 就轮转成 bridge.log.1，不会无限长。
 function writeLogFile(line) {
+  if (!dataOwnership?.held) return; // Contenders log only to stderr.
   try {
     mkdirSync(DATA_DIR, { recursive: true });
     try {
@@ -411,6 +441,7 @@ function loadState() {
 }
 
 function saveState(patch) {
+  assertOwnership();
   try {
     mkdirSync(DATA_DIR, { recursive: true });
     writeJsonAtomic(STATE_FILE, { ...loadState(), ...patch });
@@ -418,21 +449,27 @@ function saveState(patch) {
 }
 
 let credentialGeneration = 0;
+function currentCredential() {
+  if (credential) credential.expired = Number.isFinite(credential.expiresAt) && credential.expiresAt > 0
+    ? credential.expiresAt <= Date.now() : false;
+  return credential;
+}
 async function refreshCredential(force) {
-  if (!force && credential && Date.now() - credentialAt < 5 * 60 * 1000) return credential;
+  if (!force && credential && Date.now() - credentialAt < 5 * 60 * 1000) return currentCredential();
   const generation = ++credentialGeneration;
-  const c = await loadCredential(region);
-  if (generation !== credentialGeneration) return credential;
-  if (c) {
-    credential = c;
+  let result;
+  try { result = await loadCredential(region); }
+  catch { result = { status: 'temporary' }; }
+  if (generation !== credentialGeneration) return currentCredential();
+  if (result.status === 'valid') {
+    credential = result.credential;
     credentialAt = Date.now();
-  } else if (force) {
-    // 强制刷新就是要「重新读一次登录态」：读不到说明 Qoder 那边已经登出/掉线了，
-    // 这时候继续拿内存里的旧 token 去求上游，只会一路 401 让人以为插件坏了。
+  } else if (result.status === 'absent' || result.status === 'logged-out') {
     credential = undefined;
     credentialAt = 0;
   }
-  return credential;
+  // Transient IO / DPAPI / JSON failure is not evidence of logout.
+  return currentCredential();
 }
 
 function normalizeModel(m) {
@@ -471,6 +508,7 @@ function normalizeModel(m) {
 }
 
 async function refreshModels(force) {
+  assertOwnership();
   if (!force && models.length && Date.now() - modelsAt < 30 * 60 * 1000) return models;
   const cache = join(DATA_DIR, 'models.json');
   const cred = await refreshCredential(force);
@@ -809,6 +847,7 @@ function writeJsonAtomic(file, value) {
 }
 
 function recordUsage(entry, wire, tokensIn, tokensOut) {
+  assertOwnership();
   try {
     const book = loadUsageBook();
     const day = localDayKey(Date.now());
@@ -968,7 +1007,10 @@ async function* streamChat(cred, req, signal) {
         if (!line.startsWith('data:')) continue;
         const p = line.slice(5).trim();
         if (!p) continue;
-        if (p === '[DONE]') { done = true; sawEnd = true; break; }
+        if (p === '[DONE]') {
+          if (!sawEnd) yield { choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] };
+          done = true; sawEnd = true; break;
+        }
         let env;
         try { env = JSON.parse(p); } catch { continue; }
         let chunk = env;
@@ -1295,7 +1337,7 @@ async function chatCompletions(req, res) {
   const cred = await refreshCredential(false);
   if (!cred) { sendJson(res, 401, { error: { message: 'Qoder 未登录或凭证无法解密' } }); return; }
 
-  const wantStream = payload.stream !== false;
+  const wantStream = payload.stream === true;
   const controller = new AbortController();
   const cancelOnClose = bindAbort(req, res, controller);
 
@@ -1483,7 +1525,7 @@ async function anthropicMessages(req, res) {
   const up = await openUpstream(req, res, request, displayModel);
   if (!up.ok) return;
 
-  const opts = { model: displayModel, inputTokens: adapters.estimateTokens(chat.messages) };
+  const opts = { model: displayModel, inputTokens: adapters.estimateTokens(chat.messages), formatError: (error) => errorBodyOf(error).error };
   // 上游给了真实 usage 就用真实值记账；适配层会把它写在 opts.usage 上回传。
   try {
     if (chat.stream) await adapters.writeAnthropicStream(res, up.first, up.iterator, opts);
@@ -1537,7 +1579,7 @@ async function openaiResponses(req, res) {
   const up = await openUpstream(req, res, request, displayModel);
   if (!up.ok) return;
 
-  const opts = { model: displayModel, inputTokens: adapters.estimateTokens(chat.messages) };
+  const opts = { model: displayModel, inputTokens: adapters.estimateTokens(chat.messages), formatError: (error) => errorBodyOf(error).error };
   // 上游给了真实 usage 就用真实值记账；适配层会把它写在 opts.usage 上回传。
   try {
     if (chat.stream) await adapters.writeResponsesStream(res, up.first, up.iterator, opts);
@@ -1648,7 +1690,15 @@ async function startServerOnce() {
   log(`已在 127.0.0.1:${actualPort} 监听`);
 }
 
-async function boot() {
+let bootPending;
+function boot() {
+  if (!bootPending) bootPending = bootOwned().finally(() => { bootPending = undefined; });
+  return bootPending;
+}
+async function bootOwned() {
+  await ensureOwnership();
+  updateStatus.assertRecoverable(UPDATE_DIR);
+  if (actualPort) return;
   bootedAt = Date.now();
   mkdirSync(DATA_DIR, { recursive: true });
   const st = loadState();
@@ -1661,6 +1711,7 @@ async function boot() {
 }
 
 async function buildStatus() {
+  const updateResult = updateStatus.readLatest(UPDATE_DIR);
   const cred = await refreshCredential(false);
   // boot 里这两项是后台跑的（不挡端口起来），面板第一次问状态时补一次，
   // 之后都走各自的缓存。给 4 秒上限：面板 12 秒超时，不能让它等到网络超时。
@@ -1693,6 +1744,7 @@ async function buildStatus() {
     checkin: { ...(lastCheckin || { active: false }), ...scheduled },
     localUsage: usageSummary(),
     logFile: LOG_FILE,
+    updateResult,
     uptimeSeconds: Math.floor((Date.now() - bootedAt) / 1000),
     // 只报还活着的错误（成功刷新会按来源清掉），并带上「多久以前」。
     lastError: lastErrorText(),
@@ -1712,8 +1764,8 @@ async function buildStatus() {
 
 const UPDATE_REPO = process.env.QODER_BRIDGE_REPO || 'linvisxie/cindy-qoder-bridge';
 const UPDATE_API = `https://api.github.com/repos/${UPDATE_REPO}/releases/latest`;
-const UPDATE_DIR = join(DATA_DIR, 'update');
 const INSTALL_DIR = join(__dirname, '..');
+const UPDATE_DIR = updateStatus.updateDirectory(INSTALL_DIR);
 
 // 版本比较、digest 校验、zip 解包、脚本生成都在 node/update.cjs ——
 // 那一份是纯函数、可以离线跑回归测试；这里只留需要 IO 的部分。
@@ -1770,7 +1822,10 @@ async function checkUpdate() {
 // 更新在途锁：面板连点或面板+工具两路同时喊 applyUpdate 时，只允许一个真的下载安装，
 // 其余直接回「正在进行」。原来没有任何互斥，两次下载、两个安装脚本抢同一个安装目录是可能的。
 let updateInFlight = false;
+let activeUpdateAttempt;
 async function applyUpdate() {
+  await ensureOwnership();
+  updateStatus.assertRecoverable(UPDATE_DIR);
   if (updateInFlight) {
     return { applied: false, error: '更新已在进行中', message: '更新已在进行中，不用重复点，等它装完自动重启。' };
   }
@@ -1780,7 +1835,15 @@ async function applyUpdate() {
     const result = await applyUpdateOnce();
     handedOff = result.applied === true;
     return result;
-  } finally { if (!handedOff) updateInFlight = false; }
+  } catch (error) {
+    if (activeUpdateAttempt) updateStatus.writeResult(activeUpdateAttempt, {
+      status: 'not_started', phase: 'failed', error: error.message,
+      hostReceipt: 'requires_host_install',
+    });
+    throw error;
+  } finally {
+    if (!handedOff) { updateInFlight = false; activeUpdateAttempt = undefined; }
+  }
 }
 
 async function applyUpdateOnce() {
@@ -1789,12 +1852,11 @@ async function applyUpdateOnce() {
   if (!info.asset) throw new Error('最新 release 里没有 .cindy 包，无法更新');
 
   mkdirSync(UPDATE_DIR, { recursive: true });
-  const res = await fetch(info.asset.url, {
-    headers: { 'User-Agent': 'qoder-bridge' },
-    signal: AbortSignal.timeout(120000),
+  const attemptId = 'attempt-' + crypto.randomUUID();
+  activeUpdateAttempt = updateStatus.begin(UPDATE_DIR, attemptId, { version: info.latest, hostReceipt: 'requires_host_install' });
+  const bytes = await download.downloadReleaseAsset(info.asset, {
+    repo: UPDATE_REPO, version: info.latest, fetch, signal: AbortSignal.timeout(120000),
   });
-  if (!res.ok) throw new Error(`下载新版本失败：HTTP ${res.status}`);
-  const bytes = Buffer.from(await res.arrayBuffer());
 
   // 先验再落盘：校验不过就一个字节都不写进安装目录，当前版本继续跑。
   const check = updater.verifyDigest(bytes, info.asset.digest, info.asset.size);
@@ -1804,31 +1866,31 @@ async function applyUpdateOnce() {
   // A matching digest proves bytes, not plugin identity or runnable contents.
   updater.validatePackage(readZipEntries(bytes), {
     id: 'qoder-bridge', version: info.latest, currentVersion: info.current,
-    required: ['node/adapters.cjs', 'node/update.cjs'],
+    required: ['node/bootstrap.cjs', 'node/adapters.cjs', 'node/update.cjs', 'node/ownership.cjs', 'node/download.cjs', 'node/update-status.cjs'],
   });
 
   const stageDir = mkdtempSync(join(UPDATE_DIR, 'stage-'));
   // Unique paths also isolate concurrent update attempts and stale staging files.
   const scriptPath = `${stageDir}.ps1`;
-  const syncScriptPath = `${stageDir}.cjs`;
   const packagePath = `${stageDir}.cindy`;
-  const backup = `${INSTALL_DIR}.bak-${info.current}`;
+  const backup = `${INSTALL_DIR}.bak-${info.current}-${attemptId}`;
   let child;
   try {
     writeFileSync(packagePath, bytes);
     extractZipTo(bytes, stageDir);
-    writeFileSync(syncScriptPath, updater.buildSnapshotSyncScript({ installDir: INSTALL_DIR, pkgPath: packagePath }), 'utf8');
     writeFileSync(scriptPath, updater.buildApplyScript({
-      root: INSTALL_DIR, stage: stageDir, backup, pkg: packagePath,
-      syncScript: syncScriptPath, nodeExe: process.execPath, oldPid: process.pid,
+      root: INSTALL_DIR, stage: stageDir, backup, pkg: packagePath, oldPid: process.pid,
+      attemptDir: activeUpdateAttempt, latestPointer: join(UPDATE_DIR, 'latest-attempt.json'), installationPipe: pipeName(INSTALL_DIR, 'install'), ownershipPipe: pipeName(DATA_DIR),
     }), 'utf8');
+    updateStatus.writeResult(activeUpdateAttempt, { status: 'handed_off', phase: 'waiting',
+      version: info.latest, backup, hostReceipt: 'requires_host_install' });
     child = spawn('powershell.exe', ['-NoProfile', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', scriptPath], {
       detached: true, stdio: 'ignore', windowsHide: true,
     });
     await updater.waitForSpawn(child);
   } catch (e) {
     rmSync(stageDir, { recursive: true, force: true });
-    for (const file of [packagePath, scriptPath, syncScriptPath]) rmSync(file, { force: true });
+    for (const file of [packagePath, scriptPath]) rmSync(file, { force: true });
     throw new Error(`无法启动更新安装：${e.message}`);
   }
   child.unref();
@@ -1840,10 +1902,11 @@ async function applyUpdateOnce() {
 
   return {
     ...info,
-    applied: true,
+    applied: true, status: 'handed_off',
     backup,
     scriptPath,
-    message: `已下载 ${info.latest} 并成功启动后台安装脚本；worker 正在退出，Cindy 大约 20~30 秒后用新版本重新拉起。`,
+    resultPath: join(activeUpdateAttempt, 'result.json'),
+    message: `已下载 ${info.latest} 并交接安装器，尚不代表安装完成。最终结果见插件状态及 ${join(activeUpdateAttempt, 'result.json')}；宿主安装记录需通过 Cindy 原生导入完整包刷新。`,
   };
 }
 
@@ -1866,6 +1929,7 @@ rl.on('line', async (line) => {
   const method = req.method;
 
   try {
+    await ensureOwnership();
     let result;
     if (method === 'qoder/status') {
       if (!server) await boot();
