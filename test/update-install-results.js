@@ -71,10 +71,12 @@ async function waitFor(check) {
   throw new Error('Timed out waiting for test installer');
 }
 (async () => {
-  // A known test-only PID which has exited; no real worker is queried/killed.
-  const exited = spawn('powershell.exe', [...psArgs, '-Command', 'exit 0']);
-  const exitedPid = exited.pid;
-  await new Promise((resolve, reject) => { exited.once('exit', resolve); exited.once('error', reject); });
+  // Do not retain an exited child's PID: Windows can recycle it into a later
+  // PowerShell process during this suite. Use an int32-valid absent sentinel,
+  // verified before testing; production still waits on the real worker PID.
+  const exitedPid = 2147483647;
+  const absent = spawnSync('powershell.exe', [...psArgs, '-Command', `if (Get-Process -Id ${exitedPid} -ErrorAction SilentlyContinue) { exit 1 } else { exit 0 }`], { timeout: 10000 });
+  assert.equal(absent.status, 0, 'test sentinel PID must be absent');
   const waiting = setup('worker-still-live', process.pid);
   assert.notEqual(run(waiting.file).status, 0);
   assert.equal(waiting.result().status, 'not_started');

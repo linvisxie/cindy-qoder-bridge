@@ -7,7 +7,7 @@
 
 const { readFileSync, writeFileSync, mkdirSync, existsSync, readdirSync } = require('node:fs');
 const { join, resolve, basename } = require('node:path');
-const { createHash } = require('node:crypto');
+const { createHash, randomBytes } = require('node:crypto');
 
 const ROOT = resolve(__dirname, '..', '..');
 const ARTIFACTS = join(ROOT, 'artifacts');
@@ -211,6 +211,10 @@ let bootDetail = '';
     await new Promise((resolve, reject) => probe.close(error => error ? reject(error) : resolve()));
     const dataDir = join(work, '_data');
     mkdirSync(dataDir, { recursive: true });
+    // Generate the local probe secret here, rather than reading file data into
+    // an outbound request. Only this candidate worker receives the seeded key.
+    const probeToken = randomBytes(32).toString('hex');
+    writeFileSync(join(dataDir, 'state.json'), JSON.stringify({ token: probeToken }));
 
     child = spawn(process.execPath, [join(work, entry)], {
       cwd: work,
@@ -237,13 +241,11 @@ let bootDetail = '';
       await new Promise((r) => setTimeout(r, 500));
       try {
         if (child.exitCode !== null) break;
-        const state = JSON.parse(readFileSync(join(dataDir, 'state.json'), 'utf8'));
-        if (state.port !== port || typeof state.token !== 'string' || !state.token) continue;
         const res = await fetch('http://127.0.0.1:' + port + '/healthz', { signal: AbortSignal.timeout(3000) });
         if (res.ok) {
           const j = await res.json();
           const authenticated = await fetch('http://127.0.0.1:' + port + '/v1/models', {
-            headers: { Authorization: 'Bearer ' + state.token }, signal: AbortSignal.timeout(3000),
+            headers: { Authorization: 'Bearer ' + probeToken }, signal: AbortSignal.timeout(3000),
           });
           await authenticated.body?.cancel();
           bootOk = authenticated.ok && j && j.ok === true && j.port === port;
