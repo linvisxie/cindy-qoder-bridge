@@ -54,8 +54,18 @@ test('all candidates absent clears even nonforced stale cache; missing candidate
   assert.equal((await f.run('loadCredential(region)')).status, 'valid');
   assert.equal((await f.run('refreshCredential(true)')).token, 'fixture-token');
   fs.unlinkSync(path.join(f.dir, 'second/auth.v1.dat'));
-  f.advance(6 * 60 * 1000);
+  assert.equal(await f.run('refreshCredential(false)'), undefined, 'logout/removal must invalidate a warm credential immediately');
+});
+
+test('warm nonforced reads observe replacement and explicit logout without waiting for a TTL', async () => {
+  const f = fixture(); f.write('first', f.valid('ticket-a'));
+  assert.equal((await f.run('refreshCredential(true)')).token, 'ticket-a');
+  f.write('first', f.valid('ticket-b'));
+  assert.equal((await f.run('refreshCredential(false)')).token, 'ticket-b');
+  f.write('first', { token: null });
   assert.equal(await f.run('refreshCredential(false)'), undefined);
+  f.write('first', f.valid('ticket-c'));
+  assert.equal((await f.run('refreshCredential(false)')).token, 'ticket-c');
 });
 
 test('forced IO, decrypt, key and JSON failures retain old credential and evaluate expiresAt at current time', async () => {

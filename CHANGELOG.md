@@ -2,9 +2,11 @@
 
 版本号跟着 Cindy 插件清单（`plugin/ghost.json` 的 `version`）走。
 
-## 未发布（审查修复）
+## 0.1.21
 
-本节记录审查分支的最小修复，不修改清单版本；下方历史记录保留为当时发布说明，不代表本轮验证结果。本轮代码完成，待最终验证，尚未发布 / 安装。
+**2026-11-11** · 审查硬化、协议修复与 Qoder 凭据实时读取
+
+本节纳入此前未发布审查改动。公开发行状态以 GitHub Releases 为准，发布不等于本机安装；下方历史记录原样保留，不代表本轮验证结果。
 
 - 旧 issue #15（stream 默认值）与 #19（Responses reasoning）同属本轮剩余问题范围，不再暂缓：三协议仅 `stream === true` 返回 SSE，缺省或 `false` 返回单个 JSON；上游仍可 `stream: true` 后聚合。Responses 流式 / 非流式提供含 `summary_text` 的 reasoning item；流式使用标准 `response.reasoning_summary_part.*` / `response.reasoning_summary_text.*` 事件，不虚构推理内容或 usage。依赖旧默认流式行为的调用方需显式传 `stream: true`。
 - 新增 `test/protocol-defaults-reasoning.js`，覆盖协议默认值与 Responses reasoning 回归；实际结果以测试命令输出为准，不固定断言数，不把未运行 / SKIP 记作通过。
@@ -12,14 +14,16 @@
 - 共享适配器流中错误统一走 worker `formatError` 中文分类，保留已获 usage，并以失败终止。
 - 更新强制校验合法的 64 位十六进制 SHA-256，不再允许 size 降级。新增 `download.cjs`：严格限制 GitHub HTTPS repo / tag / asset、逐跳重定向域名、32 MiB 包大小及最多 5 跳。
 - 新增 `bootstrap.cjs`，清单 `node.entry` 为 `node/bootstrap.cjs`：先由 `ownership.cjs` 按 `INSTALL_DIR`（`install`）→ `DATA_DIR`（`data`）固定顺序取得 OS 独占锁，之后才加载全部业务模块 / worker。同一安装目录即使数据目录不同也拒绝同时运行；多实例的安装目录和数据目录必须都不同，换端口不能绕过。Windows 命名管道，Linux abstract socket 仅供 offline CI；不扩大权限或平台支持。
-- Qoder 凭据读取区分 `valid` / `absent` / `logged-out` / `temporary`，按当前时间判断过期，避免将临时读取失败当登出。
+- **Qoder #31**：移除 `refreshCredential` 五分钟 time-only fastpath；普通读取立即观察 logout / delete / replace，明确退出或缺失立即清除旧缓存，仅 `temporary` 失败允许旧票 fallback，过期按当前时间判断。DPAPI key 仍按 `Local State` 身份缓存，身份变化使 key cache 失效；key helper 合并单 profile inflight，失败后冷却 1 秒，auth 仍逐次读取。凭据读取区分 `valid` / `absent` / `logged-out` / `temporary`。
+- **凭据验收完成**：本机已有布尔验收记录 `stage=complete`、`ok=true`；回归结果以 `node test/credential-reading.js`、`node test/review-regressions.js` 的实际输出为准。真实 Qoder CN 由用户退出后，普通路径立即清缓存；重新登录恢复 `valid`。真实 auth 文件短暂 rename 移除后返回 `absent`、清缓存，并无覆盖地恢复；真实 `Local State` 逐字未改，最终真实登录正常。
+- **副本实测边界**：临时副本上的真实 auth 载荷配合 Windows DPAPI 保护的新 AES key 轮换通过，key cache invalidated；副本临时损坏保留旧票，VM 局部推进时间验证 expired，临时副本已删除。未修改 / 轮换 Windows 系统根密钥，也未证明真实客户端自然生成新 key；全程无上游请求。详见 [凭据验收记录](docs/CREDENTIAL-ACCEPTANCE-2026-11-11.md)。独立真实 profile 复读已确认 valid、未过期且与 cache 一致，未修改真实 profile、无上游请求；见[永久布尔证据](docs/credential-acceptance-2026-11-11.json)。
 - 安装器等待旧 PID 退出，未退出则停止；退出后同样按 install → data 顺序取得双锁并在安装全过程持有。取得两锁后校验 `latest-attempt.json` 的 attempt 身份，迟到脚本若指针换代或不存在即拒绝复制。持久化每次 journal attempt / result；复制失败尝试回滚，rollback 不覆盖 journal，失败保留诊断与 backup。
 - 持久更新目录统一为 `UPDATE_DIR = canonicalDirectory(INSTALL_DIR) + '.updates'`，即规范化安装目录同级的 `<安装目录>.updates`，不再使用数据目录的 `update/`。bootstrap、worker 与安装器都检查此 journal，与 `DATA_DIR` 无关，换数据目录不能绕过。
-- 新增 `update-status.cjs`：中断的 copy / rollback 阻止 boot；journal `begin` 与 `applyUpdate` 禁止覆盖尚未恢复的 attempt 指针，`begin` 拒绝 previous `handed_off`。pending handoff 未确认结果时不能新更新，要先检查 `<安装目录>.updates/install.log`，不承诺自动重试。
+- 新增 `update-status.cjs`：中断的 copy / rollback 阻止 boot；journal `begin` 与 `applyUpdate` 禁止覆盖尚未恢复的 attempt 指针，`begin` 拒绝 previous `handed_off`。pending handoff 未确认结果时不能新更新，要先检查 `<安装目录>.updates/attempt-*/install.log`，不承诺自动重试。
 - **恢复步骤**：Cindy 原生导入完整包不会清除安装目录同级的 journal，也不会自动解除阻断。中断 copy / rollback 失败后保留所有日志与 backup；原生导入完整 `.cindy` 包并确认成功后，停用插件，将 `<安装目录>.updates/latest-attempt.json` 重命名保留诊断，再启用。不要删除备份和日志。
 - **不再自动同步 Cindy 宿主安装快照**：移除直接修改 `ghost-install-state` 安装收据以及通过 `process.execPath` 执行同步脚本的做法。运行文件更新成功不等于宿主安装记录刷新；Cindy 0.1.128 没有已验证的公开插件自写收据 API，用户须通过 Cindy 原生导入完整 `.cindy` 包刷新记录。
-- 新增登记为 offline 的 `test/bootstrap.js`：以临时安装副本、临时数据目录与独立端口隔离，验证双锁前不加载业务模块 / worker 及目录冲突拒绝启动，不触碰真实安装或依赖登录态。新增 `test/ownership.js`、`test/update-download.js`、`test/update-install-results.js`、`test/update-status.js`、`test/credential-reading.js`；更新共享回归、打包与 CI 登记。执行 `node .github/scripts/ci-run.cjs --mode offline` 及 README 所列脚本获取实际结果，不沿用旧测试计数。
-- 验证边界：Cindy 0.1.128 以 `require` 加载 Node entry，已验证 bootstrap 与该方式兼容，不等于本轮已发布 / 安装。Windows 故障测试使用真实临时目录，不是真实插件安装；没有真实用户登录 / 退出测试。未运行 / SKIP 不等于通过，不承诺无 bug。
+- 新增登记为 offline 的 `test/bootstrap.js`：以临时安装副本、临时数据目录与独立端口隔离，验证双锁前不加载业务模块 / worker 及目录冲突拒绝启动，不触碰真实安装或依赖登录态。新增 `test/ownership.js`、`test/update-download.js`、`test/update-install-results.js`、`test/update-status.js`、`test/credential-reading.js`、offline `test/credential-key-cache.js`；DPAPI helper 与 credential-reading 回归均已通过，具体结果以命令输出为准。更新共享回归、打包与 CI 登记。执行 `node .github/scripts/ci-run.cjs --mode offline` 及 README 所列脚本获取实际结果，不沿用旧测试计数。
+- 验证边界：Cindy 0.1.128 以 `require` 加载 Node entry，已验证 bootstrap 与该方式兼容，公开发行状态以 GitHub Releases 为准，发布不等于本机安装。Windows 安装故障测试使用真实临时目录，不是真实插件安装；本版 Qoder 真实用户退出 / 重登凭据验收已完成，范围与副本实测边界见上文。未运行 / SKIP 不等于通过，不承诺无 bug。
 
 ## 0.1.20
 

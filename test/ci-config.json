@@ -5,6 +5,7 @@
     { "script": "protocol-defaults-reasoning", "timeout": 120 },
     { "script": "ownership", "timeout": 180 },
     { "script": "credential-reading", "timeout": 120 },
+    { "script": "credential-key-cache", "timeout": 120 },
     { "script": "update-download", "timeout": 120 },
     { "script": "update-install-results", "timeout": 240 },
     { "script": "update-status", "timeout": 120 },
@@ -38,6 +39,11 @@
     }
   ],
   "live": [
+    {
+      "script": "credential-live",
+      "timeout": 960,
+      "why": "仅手动授权 Windows 真实凭据退出/重登录/临时删除验收；副本实际 DPAPI 密钥轮换，无上游请求，必须显式传参"
+    },
     {
       "script": "e2e-package",
       "timeout": 300,

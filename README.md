@@ -46,6 +46,10 @@ Cindy 的三个 harness 引擎（`pi` / `claude-code` / `codex`）都能接。
   <img src="assets/models.png" width="620" alt="Cindy 供应商页的模型列表：DeepSeek-Flash · 免费、DeepSeek-V4-Pro · x0.5、GLM-5.3-Flash · x0.1 等">
 </p>
 
+## 0.1.21 验收与发行状态（2026-11-11）
+
+已将未发布审查修复纳入本版，公开发行状态以 GitHub Releases 为准，发布不等于本机安装。真实 Qoder CN 退出 → 普通读取立即清缓存 → 用户重新登录 `valid`，以及真实 auth 短暂移除 / 无覆盖恢复均已验收；真实 `Local State` 逐字未改，最终登录正常。临时副本上的真实 auth + Windows DPAPI 保护的新 AES key 轮换、key cache 失效、临时损坏 fallback 和 VM 局部时间推进过期验证也已通过，副本已删除，全程无上游请求。**未修改或轮换 Windows 系统根密钥，未验证真实客户端自然生成新 key。** 详见 [凭据验收记录](docs/CREDENTIAL-ACCEPTANCE-2026-11-11.md)。独立真实 profile 复读已确认 `valid`、未过期且与 cache 一致，未修改真实 profile、无上游请求；见[永久布尔证据](docs/credential-acceptance-2026-11-11.json)。
+
 ## 工作原理
 
 ```
@@ -173,13 +177,13 @@ AI 侧也能问：`qoder_status`、`qoder_endpoint`、`qoder_refresh`、`qoder_c
 ## 更新安全与运行边界
 
 - 更新必须提供合法的 **64 位十六进制 SHA-256** 并匹配包内容，不再降级成仅比较 size。下载仅接受本仓库指定 repo / tag / asset 的 GitHub HTTPS 地址；重定向逐跳检查允许域名，最多 5 跳，包上限 32 MiB。
-- 安装器等待旧 PID 退出；未退出就停止，不覆盖文件。退出后同样按 `INSTALL_DIR`（`install`）→ `DATA_DIR`（`data`）固定顺序取得 OS 独占锁，并在安装全过程持有双锁。取得双锁后，安装器校验 `latest-attempt.json` 的 attempt 身份；迟到脚本发现指针换代或不存在即拒绝复制。每次更新持久化 journal attempt / result；复制失败尝试回滚，回滚不覆盖 journal，失败保留诊断和 backup。`update-status` 检测到中断的 copy / rollback 会禁止 boot；journal `begin` 与 `applyUpdate` 均禁止覆盖尚未恢复的 attempt 指针，`begin` 拒绝 previous `handed_off`。pending handoff 未确认结果时不能发起新更新，应先检查 `<安装目录>.updates/install.log`，不保证自动重试。
+- 安装器等待旧 PID 退出；未退出就停止，不覆盖文件。退出后同样按 `INSTALL_DIR`（`install`）→ `DATA_DIR`（`data`）固定顺序取得 OS 独占锁，并在安装全过程持有双锁。取得双锁后，安装器校验 `latest-attempt.json` 的 attempt 身份；迟到脚本发现指针换代或不存在即拒绝复制。每次更新持久化 journal attempt / result；复制失败尝试回滚，回滚不覆盖 journal，失败保留诊断和 backup。`update-status` 检测到中断的 copy / rollback 会禁止 boot；journal `begin` 与 `applyUpdate` 均禁止覆盖尚未恢复的 attempt 指针，`begin` 拒绝 previous `handed_off`。pending handoff 未确认结果时不能发起新更新，应先检查 `<安装目录>.updates/attempt-*/install.log`，不保证自动重试。
 - 持久更新目录统一为 `UPDATE_DIR = canonicalDirectory(INSTALL_DIR) + '.updates'`，即规范化安装目录同级的 `<安装目录>.updates`，不再使用数据目录的 `update/`。bootstrap、worker 与安装器都检查这里的 journal，与 `DATA_DIR` 无关，换数据目录不能绕过，rollback 也不覆盖它。
 - **中断恢复需手动处理 journal，原生导入不会自动解除阻断。** Cindy 原生导入完整 `.cindy` 包不会清除安装目录同级的 journal。中断 copy / rollback 失败后，保留所有日志与 backup；通过 Cindy 原生导入完整包并确认成功后，停用插件，将 `<安装目录>.updates/latest-attempt.json` **重命名保留诊断**，再启用插件。不要删除备份和日志。
 - **自更新成功仅表示插件运行文件替换成功，不代表 Cindy 的宿主安装记录已刷新。** 不再自动同步宿主安装快照，也不直接写 `ghost-install-state` 安装收据或通过 `process.execPath` 执行同步脚本。Cindy 0.1.128 尚无已验证的公开插件自写收据 API；请通过 **Cindy 插件页原生导入完整 `.cindy` 包**刷新安装记录。
 - 清单 `node.entry` 为 `node/bootstrap.cjs`：先按 `INSTALL_DIR`（`install`）→ `DATA_DIR`（`data`）固定顺序取得 OS 独占锁，之后才加载全部业务模块 / worker。Windows 使用命名管道，Linux abstract socket 仅用于 offline CI，不代表支持 Linux 运行插件。**同一安装目录即使数据目录不同也拒绝同时运行；不同端口也不能共享数据目录。多实例的安装目录和数据目录必须都不同。**
-- Qoder 凭据读取区分 `valid` / `absent` / `logged-out` / `temporary`，过期按当前时间判断；临时读取失败不等同登出。适配器流中错误使用 worker 的 `formatError` 中文分类，保留已获 usage，并按失败终止，不伪装成正常完成。
-- Cindy 0.1.128 通过 `require` 加载 Node entry，已验证与 bootstrap 兼容；这不等于本轮改动已发布或安装。本轮 Windows 故障验证使用真实临时目录，**不是真实插件安装验证**；没有真实用户登录 / 退出测试。测试通过不代表无 bug，也不扩大原有权限。
+- Qoder #31 移除 `refreshCredential` 五分钟 time-only fastpath：普通读取立即观察 logout / delete / replace，明确退出或缺失立即清缓存，仅 `temporary` 失败允许旧票 fallback。DPAPI key 仍按 `Local State` 身份缓存，身份变化使 key cache 失效；key helper 合并单 profile 的 inflight，失败后冷却 1 秒，auth 仍逐次读取。凭据读取区分 `valid` / `absent` / `logged-out` / `temporary`，过期按当前时间判断；临时读取失败不等同登出。适配器流中错误使用 worker 的 `formatError` 中文分类，保留已获 usage，并按失败终止，不伪装成正常完成。
+- Cindy 0.1.128 通过 `require` 加载 Node entry，已验证与 bootstrap 兼容；公开发行状态以 GitHub Releases 为准，发布不等于本机安装。本轮 Windows 安装故障验证使用真实临时目录，**不是真实插件安装验证**；本版真实用户退出 / 重登凭据验收已完成，详见上方验收记录。测试通过不代表无 bug，也不扩大原有权限。
 
 ## 运行数据在哪
 
@@ -189,7 +193,7 @@ AI 侧也能问：`qoder_status`、`qoder_endpoint`、`qoder_refresh`、`qoder_c
 | `%APPDATA%\CindyGlobal\qoder-bridge\state.json` | 本地端点 token + 端口 |
 | `%APPDATA%\CindyGlobal\qoder-bridge\models.json` | 模型目录缓存（30 分钟） |
 | `%APPDATA%\CindyGlobal\qoder-bridge\usage.json` | 本地用量账本（按天按模型，留 60 天） |
-| `<安装目录>.updates/`（`UPDATE_DIR`） | 安装目录同级的持久更新 journal、`latest-attempt.json`、`install.log`、下载包、暂存目录与替换脚本；与数据目录无关 |
+| `<安装目录>.updates/`（`UPDATE_DIR`） | 安装目录同级的持久更新 journal、`latest-attempt.json`、`attempt-*/install.log`、下载包、暂存目录与替换脚本；与数据目录无关 |
 | `%APPDATA%\CindyGlobal\qoder-bridge\bridge.log` | 运行日志，超 2 MB 自动滚成 `.1` |
 
 **你的 Qoder token 不会被写进这些文件** —— 每次都是现从 Qoder 客户端目录里的 `auth.v1.dat` 解密，只在内存里用。
@@ -222,6 +226,7 @@ node test\update-download.js        :: 下载限制
 node test\update-install-results.js :: 安装故障与结果记录
 node test\update-status.js          :: 更新中断与启动阻断
 node test\credential-reading.js     :: 凭据分类与过期
+node test\credential-key-cache.js   :: offline：key inflight 合并与失败冷却
 node test\e2e-package.js
 node test\e2e-panel.js
 node test\e2e-brain.js
@@ -234,7 +239,7 @@ node test\features.js
 想换模型：`node test\smoke-protocols.js <模型 id>`（默认 `qfmodel`，免费）。
 隔离测试使用临时安装副本、临时数据目录与独立端口，不与正在运行的实例共享安装目录或数据目录。`test/bootstrap.js` 登记为 offline，验证双锁取得前不加载业务模块 / worker，以及目录冲突拒绝启动；不需要登录态或真实安装，也不代表真实插件安装验证。
 
-本轮新增 `test/protocol-defaults-reasoning.js`；代码完成，待最终验证，尚未发布 / 安装。测试结果与统计以 `node .github/scripts/ci-run.cjs --mode offline` 及上述单项命令的实际输出为准，不固定断言数；未运行 / SKIP 不等于通过。
+本版包含 `test/protocol-defaults-reasoning.js` 与 offline `test/credential-key-cache.js` 回归。本机已有凭据验收记录为 `stage=complete`、`ok=true`（见[验收记录](docs/CREDENTIAL-ACCEPTANCE-2026-11-11.md)）；独立真实 profile 复读已通过；DPAPI helper 与 credential-reading 回归均通过。公开发行状态以 GitHub Releases 为准，发布不等于本机安装；不将凭据验收等同于全部 live 上游测试通过。测试结果与统计以 `node .github/scripts/ci-run.cjs --mode offline` 及上述单项命令的实际输出为准，不固定断言数；未运行 / SKIP 不等于通过。
 
 ### CI 跑哪些、哪些只能在本地跑
 
@@ -271,7 +276,7 @@ node .github\scripts\ci-run.cjs --mode offline   :: 与 GitHub Actions 同一份
 - **上下文只能报一个数。** Cindy 的供应商模型只认单一数值，所以报了最大档 1M。
 - **额度重置时间拿不到。** Qoder 的 `/sash/api/v2/me/usage` 不返回这个字段（实测返回的键里没有），面板会显示「Qoder 接口没给」。
 - **依赖 Qoder 的内部接口。** 上游一改，插件就失效。这不是「长期稳定」的东西。
-- **本轮协议兼容性行为变更（代码完成，待最终验证，尚未发布 / 安装）**：旧 issue #15（stream 默认值）与 #19（Responses reasoning）同属本轮剩余问题范围，不再暂缓。三协议仅在 `stream === true` 时返回 SSE；缺省或 `false` 返回单个 JSON。上游仍可使用 `stream: true` 再聚合。Responses 流式 / 非流式提供含 `summary_text` 的 reasoning item；流式使用标准 `response.reasoning_summary_part.*` / `response.reasoning_summary_text.*` 事件，只传递真实上游推理内容与 usage，不虚构。依赖旧默认流式行为的调用方需显式传 `stream: true`；尚不能将本轮行为视为已安装版本的能力。
+- **0.1.21 协议兼容性行为变更（公开发行状态以 GitHub Releases 为准，发布不等于本机安装）**：旧 issue #15（stream 默认值）与 #19（Responses reasoning）同属本轮剩余问题范围，不再暂缓。三协议仅在 `stream === true` 时返回 SSE；缺省或 `false` 返回单个 JSON。上游仍可使用 `stream: true` 再聚合。Responses 流式 / 非流式提供含 `summary_text` 的 reasoning item；流式使用标准 `response.reasoning_summary_part.*` / `response.reasoning_summary_text.*` 事件，只传递真实上游推理内容与 usage，不虚构。依赖旧默认流式行为的调用方需显式传 `stream: true`；本机可用行为以实际安装版本为准。
 
 ## 免责声明
 

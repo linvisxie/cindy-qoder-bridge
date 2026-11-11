@@ -177,36 +177,54 @@ Write-Output ([Convert]::ToBase64String($key))
 `;
 
 const keyCache = new Map();
+const keyInflight = new Map();
+const keyRetryAfter = new Map();
 
 function localStateIdentity(p) {
   try { return createHash('sha256').update(readFileSync(p)).digest('hex'); } catch { return undefined; }
 }
 
 /** 解主密钥。异步版：走 execFile，不阻塞事件循环。 */
-function oscryptKeyFor(appDir) {
-  return new Promise((resolve) => {
-    const statePath = join(appDir, 'Local State');
+async function oscryptKeyFor(appDir) {
+  const statePath = join(appDir, 'Local State');
+  // Bound work if Local State keeps rotating; the next credential read can retry.
+  for (let checks = 0; checks < 3; checks++) {
+    const pending = keyInflight.get(appDir);
+    if (pending) { await pending; continue; } // Recheck identity after every shared wait.
     const identity = localStateIdentity(statePath);
-    if (identity === undefined) { resolve(undefined); return; }
+    if (identity === undefined) return undefined;
     const cached = keyCache.get(appDir);
-    if (cached && cached.identity === identity) { resolve(cached.key); return; }
-    const b64 = Buffer.from(DPAPI_SCRIPT, 'utf16le').toString('base64');
-    execFile('powershell.exe', [
-      '-NoProfile', '-NonInteractive', '-EncodedCommand', b64,
-    ], {
-      env: { ...process.env, QODER_APP_DIR: appDir },
-      encoding: 'utf8',
-      timeout: 20000,
-      windowsHide: true,
-      maxBuffer: 1024 * 1024,
-    }, (err, stdout) => {
-      if (err) { log('dpapi failed', err.message.slice(0, 200)); resolve(undefined); return; }
-      const key = Buffer.from(String(stdout).trim(), 'base64');
-      if (key.length !== 32) { resolve(undefined); return; }
-      keyCache.set(appDir, { identity, key });
-      resolve(key);
+    if (cached && cached.identity === identity) return cached.key;
+    if (Date.now() < (keyRetryAfter.get(appDir) ?? 0)) return undefined;
+    const attempt = Promise.resolve().then(() => new Promise((resolve, reject) => {
+      const b64 = Buffer.from(DPAPI_SCRIPT, 'utf16le').toString('base64');
+      execFile('powershell.exe', [
+        '-NoProfile', '-NonInteractive', '-EncodedCommand', b64,
+      ], {
+        env: { ...process.env, QODER_APP_DIR: appDir },
+        encoding: 'utf8',
+        timeout: 20000,
+        windowsHide: true,
+        maxBuffer: 1024 * 1024,
+      }, (err, stdout) => {
+        if (err) { reject(err); return; }
+        const key = Buffer.from(String(stdout).trim(), 'base64');
+        if (key.length !== 32) { reject(new Error('invalid DPAPI key length')); return; }
+        resolve(key);
+      });
+    })).then(key => {
+      if (localStateIdentity(statePath) === identity) keyCache.set(appDir, { identity, key });
+      keyRetryAfter.delete(appDir);
+    }).catch(err => {
+      keyRetryAfter.set(appDir, Date.now() + 1000);
+      log('dpapi failed', String(err.message).slice(0, 200));
+    }).finally(() => {
+      if (keyInflight.get(appDir) === attempt) keyInflight.delete(appDir);
     });
-  });
+    keyInflight.set(appDir, attempt);
+    await attempt;
+  }
+  return undefined;
 }
 
 function appDataRoot() {
@@ -454,8 +472,10 @@ function currentCredential() {
     ? credential.expiresAt <= Date.now() : false;
   return credential;
 }
-async function refreshCredential(force) {
-  if (!force && credential && Date.now() - credentialAt < 5 * 60 * 1000) return currentCredential();
+async function refreshCredential(_force) {
+  // Cache only as a fallback for temporary read/decrypt failures. A time-only
+  // fast path keeps using a logged-out/replaced ticket for up to five minutes.
+  // Reads and AES are local; the expensive DPAPI key is cached by Local State identity.
   const generation = ++credentialGeneration;
   let result;
   try { result = await loadCredential(region); }
