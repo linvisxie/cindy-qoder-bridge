@@ -14,7 +14,6 @@ const os = require('node:os');
 const zlib = require('node:zlib');
 const { join } = require('node:path');
 const { existsSync, readFileSync, writeFileSync, mkdirSync, appendFileSync, statSync, renameSync, unlinkSync } = require('node:fs');
-const { execFileSync } = require('node:child_process');
 const { createDecipheriv, createCipheriv, createHash, randomUUID, publicEncrypt, constants: cryptoConstants } = require('node:crypto');
 const { execFile } = require('node:child_process');
 const adapters = require('./adapters.cjs');

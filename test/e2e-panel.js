@@ -185,6 +185,37 @@ function fixture() {
   k.state.status.version = '1.4.0'; await k.advance(15000);
   assert.equal(k.el.updateMsg.textContent, '安装完成，当前运行版本 1.4.0');
 
+  // 无原生记录时仍显示 legacy 诊断；旧状态不是当前运行版本的安装凭据。
+  const legacy = fixture(); await settle();
+  legacy.state.status.updateResult = { status: 'handed_off', targetVersion: '1.0.0',
+    message: '已交接安装器，等待最终结果。诊断：C:/fixture/updates/result.json；Cindy 安装记录需原生导入完整包刷新。' };
+  await legacy.advance(15000);
+  assert.match(legacy.el.updateMsg.textContent, /handed_off/);
+  assert.match(legacy.el.updateMsg.textContent, /C:\/fixture\/updates\/result.json/);
+  assert.match(legacy.el.updateMsg.textContent, /需原生导入完整包刷新/);
+  assert.equal(legacy.el.checkUpdate.textContent, '检查更新');
+  // 仅 status 改变也必须重新渲染标签，不能只比较 message。
+  legacy.state.status.updateResult.status = 'success'; await legacy.advance(15000);
+  assert.match(legacy.el.updateMsg.textContent, /旧版更新记录（success）/);
+  assert.doesNotMatch(legacy.el.updateMsg.textContent, /安装完成，当前运行版本|已是最新版本/);
+  await legacy.click(); await legacy.click();
+  const activeMessage = legacy.el.updateMsg.textContent;
+  for (const status of ['handed_off', 'success']) {
+    legacy.state.status.updateResult = { status, targetVersion: '1.0.0', message: '旧安装器日志' };
+    await legacy.advance(15000);
+    assert.equal(legacy.el.updateMsg.textContent, activeMessage);
+    assert.equal(legacy.el.checkUpdate.textContent, '重新打开安装确认');
+  }
+  legacy.state.status.version = '1.1.0'; await legacy.advance(15000);
+  assert.equal(legacy.el.updateMsg.textContent, '安装完成，当前运行版本 1.1.0');
+  legacy.state.check = { hasUpdate: false, current: '1.1.0', latest: '1.1.0' };
+  await legacy.click();
+  for (const status of ['handed_off', 'success']) {
+    legacy.state.status.updateResult = { status, message: '旧安装器日志：C:/fixture/updates/result.json' };
+    await legacy.advance(15000);
+    assert.equal(legacy.el.updateMsg.textContent, '已是最新版本（1.1.0）');
+  }
+
   const j = fixture(); await settle();
   j.state.hang = 'checkUpdate'; await j.click(); await j.advance(30001);
   assert.equal(j.el.checkUpdate.disabled, false); assert.match(j.el.updateMsg.textContent, /检查失败.*超时/);

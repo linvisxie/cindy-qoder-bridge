@@ -206,13 +206,14 @@
   }
   function renderUpdate(st) {
     const native = st.updateResult || {};
-    const snapshot = JSON.stringify([st.version, native.state, native.targetVersion, native.message]);
+    const snapshot = JSON.stringify([st.version, native.state, native.status, native.targetVersion,
+      native.message, native.error, native.resultPath]);
     if (updateBusy || snapshot === updateSnapshot) return;
     updateSnapshot = snapshot;
     runningVersion = st.version || runningVersion;
     // 「已最新」只能由检查确认，保留到下次主动操作；轮询（包括迟到的旧版本）不能覆盖。
     if (checkedLatest) return;
-    const target = targetVersion || native.targetVersion;
+    const target = targetVersion || (native.state ? native.targetVersion : '');
     // 完成必须达到本轮目标；旧 attempt 的 completed 不能清掉更高的待安装目标。
     if (target && versionAtLeast(st.version, target)) {
       targetVersion = '';
@@ -227,6 +228,10 @@
         : native.state === 'awaiting_confirmation' ? '正在等待 Cindy 原生安装确认；若已取消，可重新打开安装确认。'
         : '尚未确认安装完成，可重新打开安装确认。';
       updateMessage((targetVersion ? '目标版本 ' + targetVersion + '：' : '') + (native.message || fallback));
+    } else if (!native.state && native.status && !targetVersion) {
+      // 旧安装日志仅作诊断，不是原生完成凭据，也不能覆盖本轮待安装目标。
+      updateMessage('旧版更新记录（' + native.status + '）：'
+        + (native.message || native.error || native.resultPath || '暂无诊断信息'));
     }
     updateButton();
   }
