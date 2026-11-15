@@ -51,6 +51,10 @@ glance which are cheap right in Cindy's provider list:
   <img src="assets/models.png" width="620" alt="Model list on Cindy's provider page: DeepSeek-Flash · Free, DeepSeek-V4-Pro · x0.5, GLM-5.3-Flash · x0.1">
 </p>
 
+## 0.1.22 native-update fix (2026-11-15)
+
+The old `spawn` event meant only that a request process started, not that installation succeeded: the Qoder incident left four extracted copies while 0.1.20 was still running; Trae remained on 0.1.12. This does not establish that the host killed a detached process. Updates now use Cindy's native installation confirmation. Completion requires a new worker running at least the target version; a subsequent GitHub latest check determines whether it is up to date. This round makes no model requests; that scope does not apply to historical tests. No live acceptance, publication or local installation is claimed for this round; a final completion receipt will be recorded separately. See also the independent [Trae bridge](https://github.com/linvisxie/trae-cindy-bridge) 0.1.14.
+
 ## 0.1.21 acceptance and release status (2026-11-11)
 
 Previously unreleased review fixes are included. See GitHub Releases for public release status; publication does not mean local installation. Real Qoder CN user logout immediately cleared the cache on the ordinary read path; user login returned `valid`. Briefly renaming away the real auth file returned `absent`, cleared the cache, and restoration without overwriting succeeded. Real `Local State` remained byte-for-byte unchanged and the final real login was healthy. A temporary copy using the real auth payload and a new Windows-DPAPI-protected AES key passed rotation and key-cache invalidation checks; temporary corruption fallback and VM-local time advancement for expiry also passed. Copies were deleted; no upstream requests were made. **No Windows system master key was changed or rotated, and natural key generation by the real client was not verified.** See the [credential acceptance record](docs/CREDENTIAL-ACCEPTANCE-2026-11-11.md). An independent real-profile reread confirmed valid, unexpired credentials matching the cache, without modifying the real profile or making upstream requests; see the [permanent boolean evidence](docs/credential-acceptance-2026-11-11.json).
@@ -87,13 +91,14 @@ Main components:
 | `plugin/node/bootstrap.cjs` | Manifest `node.entry` (`node/bootstrap.cjs`): acquires install and data locks before loading any business modules / worker |
 | `plugin/node/worker.cjs` | Resident Node process: decrypts login state, serves HTTP, routes three protocols |
 | `plugin/node/adapters.cjs` | Protocol translation between Anthropic / Responses and OpenAI Chat |
-| `plugin/node/update.cjs` | Pure functions for self-update: version compare, digest check, unzip, script generation |
+| `plugin/node/native-update.cjs` | Production native update: validate the package, locate the same running Cindy.exe, and hand off through the public `.cindy` file-open contract for host confirmation |
+| `plugin/node/update.cjs` | Shared version / digest / ZIP helpers; legacy script generation remains only for old regressions and recovery, not production installation |
 | `plugin/node/download.cjs` | Update URL, redirect and package-size restrictions |
 | `plugin/node/ownership.cjs` | OS-exclusive ownership of the install and runtime data directories |
-| `plugin/node/update-status.cjs` | Update journal attempt / result and interrupted-update boot guards |
+| `plugin/node/update-status.cjs` | Legacy journal attempt / result and interrupted-update boot guards; native updates do not write this old journal |
 | `plugin/panel.*` | Right-side panel: account, quota, check-in, model list, Base URL / API key |
 
-It manages its own plugin files and runtime data, **not Cindy's host installation receipt or provider configuration**. Add providers manually in Cindy; see the self-update limitations below.
+It manages its own plugin files and runtime data, **not Cindy's host installation receipt or provider configuration**. Add providers manually in Cindy; native updates let the host handle files, installation registration and plugin restart in one operation.
 
 ## Requirements (check each one)
 
@@ -190,7 +195,7 @@ Cindy's own database — nothing else to manage.
 2. Port `47821` taken by something else → the worker falls through to `47822`… and the
    panel's Base URL changes, so update it in Cindy.
 3. Uninstalling and reinstalling the plugin → you'll need to re-enter the provider.
-4. After self-update replaces runtime files → import the complete `.cindy` package through Cindy's native UI to refresh the host installation record.
+4. When updating → confirm in the automatically opened Cindy native installer; no need to locate the downloaded file or import it again to refresh records.
 
 ## What the panel shows
 
@@ -201,26 +206,21 @@ Cindy's own database — nothing else to manage.
 - **Today's usage**: requests / tokens / weighted amount (tokens × factor)
 - **Model list**: each model's price factor (`· x0.2` / `· Free`) and reasoning efforts
 - **Log**: path to `bridge.log` — look here first when something breaks
-- **Check for updates**: the button to the right of **Copy config**. One click queries
-  GitHub Releases; if there's a new version the button becomes **Install x.y.z** and a
-  second click actually installs (the process exits and restarts, hence the two steps).
-  Before overwriting it backs up the whole install directory to
-  `<dir>.bak-<old version>`.
+- **Check for updates**: queries GitHub latest. If a newer version exists, click **Install x.y.z** to validate and automatically open Cindy's native installation confirmation. The host installs and restarts the plugin after confirmation. **Installation complete** appears only when a new worker runs at least the target version; a subsequent latest check determines **Up to date**. Cancellation allows retry and errors are explicit. Starting a request is not completion; confirmation-free silent installation is not promised.
 
 The AI side can ask too: five tools — `qoder_status`, `qoder_endpoint`, `qoder_refresh`,
-`qoder_checkin`, `qoder_update`. Pass `action=apply` to `qoder_update` to download and
-install.
+`qoder_checkin`, `qoder_update`. Pass `action=apply` to download and open the host's native installation confirmation, without bypassing its safety prompt.
 
 ## Update safety and runtime boundaries
 
-- Updates require a matching, valid **64-hex-digit SHA-256**; size-only fallback is no longer accepted. Downloads require the exact GitHub HTTPS repo / tag / asset, allowlisted redirect domains, at most 5 redirects and a 32 MiB package limit.
-- The installer waits for the old PID to exit and stops without overwriting if it remains alive. After exit, it acquires OS-exclusive locks in the same fixed order, `INSTALL_DIR` (`install`) → `DATA_DIR` (`data`), and holds both throughout installation. After acquiring both locks, the installer validates the attempt identity in `latest-attempt.json`; a late script refuses to copy if the pointer has changed generation or is missing. Each journal attempt / result is persisted. Copy failures trigger rollback, which never overwrites the journal; failed rollback retains diagnostics and backups. `update-status` blocks boot after interrupted copy / rollback; journal `begin` and `applyUpdate` must not overwrite an unrecovered attempt pointer, and `begin` rejects a previous `handed_off` attempt. A pending handoff with no confirmed result blocks a new update: inspect `<install-dir>.updates/attempt-*/install.log` first. Automatic retry is not promised.
-- The persistent update directory is `UPDATE_DIR = canonicalDirectory(INSTALL_DIR) + '.updates'`: `<install-dir>.updates`, a sibling of the canonical install directory, not `update/` in the data directory. Bootstrap, worker and installer all check this journal independently of `DATA_DIR`; changing data directories cannot bypass it, and rollback never overwrites it.
-- **Recovery requires manual journal handling; native import alone does not unblock startup.** Cindy's native full `.cindy` package import does not clear this sibling journal. After interrupted copy / failed rollback, preserve all logs and backups. Import the complete package through Cindy's native UI and confirm success, then disable the plugin, **rename and retain for diagnosis** `<install-dir>.updates/latest-attempt.json`, and re-enable the plugin. Do not delete backups or logs.
-- **Successful self-update means runtime files were replaced, not that Cindy's host installation record was refreshed.** Host installation snapshots are no longer synchronized automatically. The updater neither writes `ghost-install-state` receipts directly nor invokes a sync script through `process.execPath`. Cindy 0.1.128 has no verified public API for plugins to write their own receipts. **Import the complete `.cindy` package using Cindy's native plugin UI** to refresh that record.
+- Updates require a matching, valid **64-hex-digit SHA-256**; size-only fallback is no longer accepted. Downloads require the exact GitHub HTTPS repo / tag / asset, allowlisted redirect domains, at most 5 redirects and a 32 MiB package limit. ZIP plugin identity and target version are also strictly validated.
+- **Legacy installer only (old regressions / recovery, not production):** the installer waits for the old PID to exit and stops without overwriting if it remains alive. After exit, it acquires OS-exclusive locks in the same fixed order, `INSTALL_DIR` (`install`) → `DATA_DIR` (`data`), and holds both throughout installation. After acquiring both locks, the installer validates the attempt identity in `latest-attempt.json`; a late script refuses to copy if the pointer has changed generation or is missing. Each journal attempt / result is persisted. Copy failures trigger rollback, which never overwrites the journal; failed rollback retains diagnostics and backups. `update-status` blocks boot after interrupted copy / rollback; journal `begin` and `applyUpdate` must not overwrite an unrecovered attempt pointer, and `begin` rejects a previous `handed_off` attempt. A pending handoff with no confirmed result blocks a new update: inspect `<install-dir>.updates/attempt-*/install.log` first. Automatic retry is not promised.
+- **Legacy journal only (native updates do not write it):** the persistent update directory is `UPDATE_DIR = canonicalDirectory(INSTALL_DIR) + '.updates'`: `<install-dir>.updates`, a sibling of the canonical install directory, not `update/` in the data directory. Bootstrap, worker and installer all check this journal independently of `DATA_DIR`; changing data directories cannot bypass it, and rollback never overwrites it.
+- **Legacy interrupted-update recovery requires manual journal handling; native import alone does not unblock startup.** Cindy's native full `.cindy` package import does not clear this sibling journal. After interrupted copy / failed rollback, preserve all logs and backups. Import the complete package through Cindy's native UI and confirm success, then disable the plugin, **rename and retain for diagnosis** `<install-dir>.updates/latest-attempt.json`, and re-enable the plugin. Do not delete backups or logs.
+- **Production updates use Cindy's native installer:** on Windows the validated package is opened through the public `.cindy` file-open contract of the same actual running `Cindy.exe`. Host safety confirmation remains required; after confirmation the host handles files, installation registration and plugin restart together. The plugin never directly writes receipt / trust, copies the install directory, exits its worker for installation, or launches PowerShell background copy. A successful open request is not completed installation.
 - Manifest `node.entry` is `node/bootstrap.cjs`. It acquires OS-exclusive locks in the fixed order `INSTALL_DIR` (`install`) → `DATA_DIR` (`data`) before loading any business modules / worker. Windows uses named pipes; Linux abstract sockets are for offline CI only, not Linux runtime support. **The same install directory cannot run concurrently even with different data directories; different ports cannot share a data directory either. Multiple instances require both different install directories and different data directories.**
 - Qoder #31 removes the five-minute time-only fastpath in `refreshCredential`: ordinary reads immediately observe logout / delete / replace, clearing cached credentials on confirmed logout or absence; only `temporary` failure permits old-ticket fallback. DPAPI keys remain cached by `Local State` identity; identity changes invalidate the key cache. The key helper coalesces inflight work per profile and applies a one-second cooldown after failure; auth is still read on every call. Credential reads distinguish `valid`, `absent`, `logged-out` and `temporary`, checking expiry against the current time. Temporary read failure is not logout. Adapter stream errors use the worker's Chinese `formatError` classification, retain received usage and terminate as failure rather than successful completion.
-- Cindy 0.1.128 loads the Node entry through `require`; bootstrap compatibility with that loading method has been verified. See GitHub Releases for public release status; publication does not mean local installation. Windows installation fault tests use real temporary directories, **not an actual plugin installation**. Real-user Qoder logout / login credential acceptance is complete for this version; see the acceptance record above. Passing tests do not imply bug-free operation or expanded permissions.
+- Cindy 0.1.128 loads the Node entry through `require`; bootstrap compatibility with that loading method has been verified. See GitHub Releases for public release status; publication does not mean local installation. Historical Windows installation fault tests use real temporary directories, **not an actual plugin installation**. Real-user Qoder logout / login credential acceptance is complete for 0.1.21; see the acceptance record above. Passing tests do not imply bug-free operation or expanded permissions.
 
 ## Where runtime data lives
 
@@ -230,7 +230,7 @@ install.
 | `%APPDATA%\CindyGlobal\qoder-bridge\state.json` | Local endpoint token + port |
 | `%APPDATA%\CindyGlobal\qoder-bridge\models.json` | Model catalog cache (30 minutes) |
 | `%APPDATA%\CindyGlobal\qoder-bridge\usage.json` | Local usage ledger (per day per model, kept 60 days) |
-| `<install-dir>.updates/` (`UPDATE_DIR`) | Persistent update journal, `latest-attempt.json`, `attempt-*/install.log`, downloaded packages, staging dirs and replace script; sibling of the install directory, independent of the data directory |
+| `<install-dir>.updates/` (`UPDATE_DIR`) | Legacy artifacts (native updates do not write this journal): persistent update journal, `latest-attempt.json`, `attempt-*/install.log`, downloaded packages, staging dirs and replace script; sibling of the install directory, independent of the data directory |
 | `%APPDATA%\CindyGlobal\qoder-bridge\bridge.log` | Runtime log, rotates to `.1` past 2 MB |
 
 **Your Qoder token is never written to any of these files** — it's decrypted fresh from
@@ -294,7 +294,7 @@ one of the two layers of `cindy.node.request` (which makes the panel show
 per-item statuses disagreeing when a Responses stream is truncated or cut by a content
 policy, and pins down that an item status may only be `in_progress` / `completed` /
 `incomplete` — `failed` belongs to the top-level `Response` only. `update-chain` guards the
-self-update path: that `0.1.15` sorts newer than `0.1.9` (segment-wise, not
+legacy updater regression / recovery helpers, not the production installation path: that `0.1.15` sorts newer than `0.1.9` (segment-wise, not
 string-wise), that a package whose sha256 doesn't match the release digest is rejected
 before a single byte touches the install directory, and that the generated PowerShell
 waits for the old process, backs up, records the result and rolls back on copy failure. It does not sync Cindy's host installation snapshot.

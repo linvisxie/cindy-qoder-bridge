@@ -142,6 +142,7 @@ const packagedByRepoPath = {
   'node/ownership.cjs': 'plugin/node/ownership.cjs',
   'node/download.cjs': 'plugin/node/download.cjs',
   'node/update-status.cjs': 'plugin/node/update-status.cjs',
+  'node/native-update.cjs': 'plugin/node/native-update.cjs',
   'node/trae.cjs': 'plugin/node/trae.cjs',
   'LICENSE': 'LICENSE',
   'NOTICE': 'NOTICE',

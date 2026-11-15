@@ -13,16 +13,17 @@ const http = require('node:http');
 const os = require('node:os');
 const zlib = require('node:zlib');
 const { join } = require('node:path');
-const { existsSync, readFileSync, writeFileSync, mkdirSync, appendFileSync, statSync, renameSync, unlinkSync, mkdtempSync, rmSync } = require('node:fs');
+const { existsSync, readFileSync, writeFileSync, mkdirSync, appendFileSync, statSync, renameSync, unlinkSync } = require('node:fs');
 const { execFileSync } = require('node:child_process');
 const { createDecipheriv, createCipheriv, createHash, randomUUID, publicEncrypt, constants: cryptoConstants } = require('node:crypto');
 const { execFile } = require('node:child_process');
-const { spawn } = require('node:child_process');
 const adapters = require('./adapters.cjs');
 const updater = require('./update.cjs');
-const { pipeName } = require('./ownership.cjs');
 const download = require('./download.cjs');
 const updateStatus = require('./update-status.cjs');
+const native = require('./native-update.cjs');
+// Capture only after bootstrap has acquired both owners; disk replacement is not running code.
+const RUNNING_VERSION = String(JSON.parse(readFileSync(join(__dirname, '..', 'ghost.json'), 'utf8')).version || '');
 
 // ============================================================
 // 协议层（移植自 @eghrhegpe/dsh-connect-qoder 0.7.6，MIT）
@@ -1731,7 +1732,7 @@ async function bootOwned() {
 }
 
 async function buildStatus() {
-  const updateResult = updateStatus.readLatest(UPDATE_DIR);
+  const updateResult = native.readStatus(DATA_DIR, RUNNING_VERSION) || updateStatus.readLatest(UPDATE_DIR);
   const cred = await refreshCredential(false);
   // boot 里这两项是后台跑的（不挡端口起来），面板第一次问状态时补一次，
   // 之后都走各自的缓存。给 4 秒上限：面板 12 秒超时，不能让它等到网络超时。
@@ -1764,6 +1765,7 @@ async function buildStatus() {
     checkin: { ...(lastCheckin || { active: false }), ...scheduled },
     localUsage: usageSummary(),
     logFile: LOG_FILE,
+    version: RUNNING_VERSION,
     updateResult,
     uptimeSeconds: Math.floor((Date.now() - bootedAt) / 1000),
     // 只报还活着的错误（成功刷新会按来源清掉），并带上「多久以前」。
@@ -1779,31 +1781,18 @@ async function buildStatus() {
 //
 // 为什么走 GitHub API 而不是 gh CLI：gh 要登录态、要看代理配没配对，
 // 而 release 的 REST 接口匿名就能读（公开仓库），node 自带 fetch 直接打就行。
-// 这里只做「检查 + 下载 + 交给一个独立脚本去替换」，不在本进程里改自己的文件 ——
-// Windows 上正在运行的文件会被锁，硬覆盖一定失败。
+// 只检查、验证并持久保存完整包，再请求 Cindy 原生导入；worker 不覆盖自身、不退出。
 
 const UPDATE_REPO = process.env.QODER_BRIDGE_REPO || 'linvisxie/cindy-qoder-bridge';
 const UPDATE_API = `https://api.github.com/repos/${UPDATE_REPO}/releases/latest`;
 const INSTALL_DIR = join(__dirname, '..');
 const UPDATE_DIR = updateStatus.updateDirectory(INSTALL_DIR);
 
-// 版本比较、digest 校验、zip 解包、脚本生成都在 node/update.cjs ——
-// 那一份是纯函数、可以离线跑回归测试；这里只留需要 IO 的部分。
-const versionParts = updater.versionParts;
 const compareVersion = updater.compareVersion;
 const readZipEntries = updater.readZipEntries;
-const extractZipTo = updater.extractZipTo;
-
-function currentVersion() {
-  try {
-    return String(JSON.parse(readFileSync(join(INSTALL_DIR, 'ghost.json'), 'utf8')).version || '');
-  } catch {
-    return '';
-  }
-}
 
 async function checkUpdate() {
-  const mine = currentVersion();
+  const mine = RUNNING_VERSION;
   const res = await fetch(UPDATE_API, {
     headers: { 'User-Agent': 'qoder-bridge', Accept: 'application/vnd.github+json' },
     signal: AbortSignal.timeout(15000),
@@ -1811,11 +1800,14 @@ async function checkUpdate() {
   if (!res.ok) throw new Error(`查更新失败：GitHub 返回 HTTP ${res.status}`);
   const j = await res.json();
   const latest = String(j.tag_name || '').replace(/^v/i, '');
+  if (!/^\d+(?:\.\d+)*$/.test(latest)) throw new Error('查更新失败：release 版本无效');
+  const hasUpdate = compareVersion(latest, mine) > 0;
   const asset = (Array.isArray(j.assets) ? j.assets : []).find((a) => a && a.name === 'cindy-qoder-bridge.cindy');
   return {
     current: mine,
     latest,
-    hasUpdate: Boolean(latest) && compareVersion(latest, mine) > 0,
+    hasUpdate,
+    ...(!hasUpdate ? { applied: false, status: 'up_to_date', message: '已是最新版本。' } : {}),
     htmlUrl: typeof j.html_url === 'string' ? j.html_url : '',
     notes: typeof j.body === 'string' ? j.body.slice(0, 2000) : '',
     asset: asset ? {
@@ -1823,57 +1815,35 @@ async function checkUpdate() {
       size: asset.size,
       url: asset.browser_download_url,
       // GitHub 从 2025 年起在 asset 上给 digest（"sha256:…"），它就是完整性根锚，
-      // 与本机 dist 包、以及 Cindy 记的 packageSha256 三方一致。旧版本没有就退化成按 size 校验。
+      // 缺少强 SHA-256 时拒绝下载后的安装请求，不退化为仅 size 校验。
       digest: typeof asset.digest === 'string' ? asset.digest : undefined,
     } : undefined,
   };
 }
 
-/**
- * 下载新版本、验完整性、解到暂存目录，然后交给一个独立的 PowerShell 脚本去替换安装目录。
- *
- * 为什么必须交给独立脚本：Windows 上正在运行的 .js 文件被进程锁着，本进程覆盖自己
- * 一定会 EBUSY／EPERM。那个脚本等本进程退出后再动文件，Cindy 随后会把 worker 重新
- * 拉起来（实测约 24 秒），起来时读到的就是新文件。
- *
- * 覆盖前做三件事：比 digest（防止下载被截断/被换）、备份成 `<安装目录>.bak-<旧版本>`、
- * 装完同步 Cindy 的清单快照（否则管理页会停在旧版本）。
- */
-// 更新在途锁：面板连点或面板+工具两路同时喊 applyUpdate 时，只允许一个真的下载安装，
-// 其余直接回「正在进行」。原来没有任何互斥，两次下载、两个安装脚本抢同一个安装目录是可能的。
+// 仅在下载/打开请求期间互斥；用户取消原生确认后可以显式重试。
 let updateInFlight = false;
-let activeUpdateAttempt;
 async function applyUpdate() {
   await ensureOwnership();
-  updateStatus.assertRecoverable(UPDATE_DIR);
+  const previous = updateStatus.assertRecoverable(UPDATE_DIR);
+  if (previous?.status === 'handed_off') throw new Error('上次安装器已交接但尚未确认结果，请先检查安装日志。');
   if (updateInFlight) {
-    return { applied: false, error: '更新已在进行中', message: '更新已在进行中，不用重复点，等它装完自动重启。' };
+    return { applied: false, error: '更新已在进行中', message: '正在准备更新并请求Cindy原生确认，请稍候。' };
   }
   updateInFlight = true;
-  let handedOff = false;
   try {
-    const result = await applyUpdateOnce();
-    handedOff = result.applied === true;
-    return result;
-  } catch (error) {
-    if (activeUpdateAttempt) updateStatus.writeResult(activeUpdateAttempt, {
-      status: 'not_started', phase: 'failed', error: error.message,
-      hostReceipt: 'requires_host_install',
-    });
-    throw error;
+    return await applyUpdateOnce();
   } finally {
-    if (!handedOff) { updateInFlight = false; activeUpdateAttempt = undefined; }
+    updateInFlight = false;
   }
 }
 
 async function applyUpdateOnce() {
   const info = await checkUpdate();
-  if (!info.hasUpdate) return { ...info, applied: false };
+  if (!info.hasUpdate) return { ...info, applied: false, status: 'up_to_date', message: '已是最新版本。' };
   if (!info.asset) throw new Error('最新 release 里没有 .cindy 包，无法更新');
 
   mkdirSync(UPDATE_DIR, { recursive: true });
-  const attemptId = 'attempt-' + crypto.randomUUID();
-  activeUpdateAttempt = updateStatus.begin(UPDATE_DIR, attemptId, { version: info.latest, hostReceipt: 'requires_host_install' });
   const bytes = await download.downloadReleaseAsset(info.asset, {
     repo: UPDATE_REPO, version: info.latest, fetch, signal: AbortSignal.timeout(120000),
   });
@@ -1886,47 +1856,23 @@ async function applyUpdateOnce() {
   // A matching digest proves bytes, not plugin identity or runnable contents.
   updater.validatePackage(readZipEntries(bytes), {
     id: 'qoder-bridge', version: info.latest, currentVersion: info.current,
-    required: ['node/bootstrap.cjs', 'node/adapters.cjs', 'node/update.cjs', 'node/ownership.cjs', 'node/download.cjs', 'node/update-status.cjs'],
+    required: ['node/bootstrap.cjs', 'node/adapters.cjs', 'node/update.cjs', 'node/ownership.cjs', 'node/download.cjs', 'node/update-status.cjs', 'node/native-update.cjs'],
   });
 
-  const stageDir = mkdtempSync(join(UPDATE_DIR, 'stage-'));
-  // Unique paths also isolate concurrent update attempts and stale staging files.
-  const scriptPath = `${stageDir}.ps1`;
-  const packagePath = `${stageDir}.cindy`;
-  const backup = `${INSTALL_DIR}.bak-${info.current}-${attemptId}`;
-  let child;
+  const packagePath = join(UPDATE_DIR, `${crypto.randomUUID()}.cindy`);
+  writeFileSync(packagePath, bytes, { flag: 'wx' });
+  const details = { targetVersion: info.latest, fromVersion: RUNNING_VERSION,
+    packagePath, sha256: crypto.createHash('sha256').update(bytes).digest('hex') };
+  native.writeStatus(DATA_DIR, { ...details, state: 'awaiting_confirmation' });
   try {
-    writeFileSync(packagePath, bytes);
-    extractZipTo(bytes, stageDir);
-    writeFileSync(scriptPath, updater.buildApplyScript({
-      root: INSTALL_DIR, stage: stageDir, backup, pkg: packagePath, oldPid: process.pid,
-      attemptDir: activeUpdateAttempt, latestPointer: join(UPDATE_DIR, 'latest-attempt.json'), installationPipe: pipeName(INSTALL_DIR, 'install'), ownershipPipe: pipeName(DATA_DIR),
-    }), 'utf8');
-    updateStatus.writeResult(activeUpdateAttempt, { status: 'handed_off', phase: 'waiting',
-      version: info.latest, backup, hostReceipt: 'requires_host_install' });
-    child = spawn('powershell.exe', ['-NoProfile', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', scriptPath], {
-      detached: true, stdio: 'ignore', windowsHide: true,
-    });
-    await updater.waitForSpawn(child);
-  } catch (e) {
-    rmSync(stageDir, { recursive: true, force: true });
-    for (const file of [packagePath, scriptPath]) rmSync(file, { force: true });
-    throw new Error(`无法启动更新安装：${e.message}`);
+    await native.launchImport({ packagePath, sha256: details.sha256, hostExe: process.execPath });
+  } catch (error) {
+    native.writeStatus(DATA_DIR, { ...details, state: 'open_failed', error: error.message });
+    throw error;
   }
-  child.unref();
-
-  // 光交给脚本还不够：脚本里的 Wait-Process 得等到本进程真的退出才动文件。
-  // 这里主动退，让 Cindy 在 ~24 秒后把新文件拉起来；留 800ms 是给上面那条 RPC 回包写完 stdout。
-  // 如果哪天这条路径没退成功，脚本的 -Timeout 60 会兜底（虽然那时文件还锁着，替换会失败并在备份后报错）。
-  setTimeout(() => process.exit(0), 800);
-
   return {
-    ...info,
-    applied: true, status: 'handed_off',
-    backup,
-    scriptPath,
-    resultPath: join(activeUpdateAttempt, 'result.json'),
-    message: `已下载 ${info.latest} 并交接安装器，尚不代表安装完成。最终结果见插件状态及 ${join(activeUpdateAttempt, 'result.json')}；宿主安装记录需通过 Cindy 原生导入完整包刷新。`,
+    ...info, applied: false, installRequested: true, status: 'awaiting_confirmation', targetVersion: info.latest, packagePath,
+    message: '已打开Cindy原生安装确认，尚未安装；请在Cindy内确认，取消后可重试。',
   };
 }
 

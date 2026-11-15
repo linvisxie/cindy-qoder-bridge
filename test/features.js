@@ -2,8 +2,8 @@
 // 真起 worker（独立端口 + 临时数据目录），全程走真 HTTP。
 //
 // 0.1.10 起 /healthz 只剩最小集（ok / port / modelCount），完整状态改到带鉴权的
-// GET /status。所以这里不再从 /healthz 拿 token，而是直接读临时数据目录里的
-// state.json（worker 在 startServer 里监听成功后就把 token 写进去了）。
+// GET /status。预置一次性随机 token，只以带鉴权的 /status 确认本次 worker 就绪。
+// 这是完全隔离的离线测试，禁止登录态和任何 live 模型请求。
 'use strict';
 
 const { spawn } = require('node:child_process');
@@ -11,7 +11,10 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 
-const PORT = Number(process.env.FEATURES_PORT || 47981);
+const net = require('node:net');
+const { randomBytes } = require('node:crypto');
+
+let PORT;
 const WORKER = path.join(__dirname, '..', 'plugin', 'node', 'bootstrap.cjs');
 
 let pass = 0;
@@ -24,7 +27,7 @@ function skip(name, why) {
   console.log(`  --   ${name}（跳过：${why}）`);
 }
 
-function request(method, p, body, token) {
+function request(method, p, body, token, timeout = 90000) {
   return new Promise((resolve) => {
     const http = require('node:http');
     const data = body === undefined ? null : Buffer.from(JSON.stringify(body));
@@ -35,7 +38,7 @@ function request(method, p, body, token) {
         ...(token ? { authorization: 'Bearer ' + token } : {}),
         host: '127.0.0.1',
       },
-      timeout: 90000,
+      timeout,
     }, (res) => {
       const chunks = [];
       res.on('data', (c) => chunks.push(c));
@@ -52,27 +55,85 @@ function readState(dataDir) {
   try { return JSON.parse(fs.readFileSync(path.join(dataDir, 'state.json'), 'utf8')); } catch { return {}; }
 }
 
-(async () => {
-  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'qoder-features-'));
-  const child = spawn(process.execPath, [WORKER], {
-    env: { ...process.env, CINDY_QODER_DATA: dataDir, CINDY_QODER_PORT: String(PORT) },
-    stdio: ['pipe', 'pipe', 'pipe'],
+async function reservePort() {
+  const requested = process.env.FEATURES_PORT === undefined ? 0 : Number(process.env.FEATURES_PORT);
+  if (!Number.isInteger(requested) || requested < 0 || requested > 65535) throw new Error('Invalid FEATURES_PORT');
+  const server = net.createServer();
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(requested, '127.0.0.1', resolve);
   });
-  const logs = [];
-  child.stderr.on('data', (c) => logs.push(String(c)));
+  const port = server.address().port;
+  await new Promise((resolve, reject) => server.close((err) => err ? reject(err) : resolve()));
+  return port;
+}
+
+(async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'qoder-features-'));
+  const dataDir = path.join(root, 'data');
+  const token = randomBytes(32).toString('hex');
+  let child;
+  let stopped;
+  let ended = false;
+  let childFailure;
+  const assertAlive = () => {
+    if (childFailure) throw new Error(childFailure);
+    if (ended) throw new Error('worker exited unexpectedly');
+  };
+  try {
+  PORT = await reservePort();
+  const env = { ...process.env };
+  for (const key of Object.keys(env)) {
+    if (/^(XDG_|APPDATA$|LOCALAPPDATA$|USERPROFILE$|HOME$|HOMEDRIVE$|HOMEPATH$|NODE_OPTIONS$|NODE_PATH$)/i.test(key)) delete env[key];
+  }
+  const dirs = {
+    APPDATA: 'roaming', LOCALAPPDATA: 'local', USERPROFILE: 'home', HOME: 'home',
+    XDG_CONFIG_HOME: 'config', XDG_DATA_HOME: 'share', XDG_CACHE_HOME: 'cache',
+    XDG_STATE_HOME: 'state', XDG_RUNTIME_DIR: 'run',
+    XDG_CONFIG_DIRS: 'config-dirs', XDG_DATA_DIRS: 'data-dirs',
+    TEMP: 'tmp', TMP: 'tmp', TMPDIR: 'tmp',
+  };
+  for (const [key, dir] of Object.entries(dirs)) {
+    env[key] = path.join(root, dir);
+    fs.mkdirSync(env[key], { recursive: true });
+  }
+  env.HOMEDRIVE = path.parse(env.HOME).root.replace(/[\\/]$/, '');
+  env.HOMEPATH = env.HOME.slice(env.HOMEDRIVE.length);
+  fs.mkdirSync(dataDir);
+  fs.writeFileSync(path.join(dataDir, 'state.json'), JSON.stringify({ token }), { mode: 0o600 });
+  Object.assign(env, { CINDY_QODER_DATA: dataDir, CINDY_QODER_PORT: String(PORT) });
+  child = spawn(process.execPath, [WORKER], { env, stdio: ['pipe', 'pipe', 'pipe'] });
+  stopped = new Promise((resolve) => {
+    child.once('error', (err) => { childFailure = `worker startup failed: ${err.message}`; ended = true; resolve(); });
+    child.once('exit', (code, signal) => {
+      childFailure = `worker exited: code=${code}, signal=${signal}`;
+      ended = true;
+      resolve();
+    });
+  });
+  // Never print worker output: authenticated status (and diagnostics) may contain tokens.
+  child.stderr.on('data', () => {});
   child.stdout.on('data', () => {});
 
-  let health = null;
+  let ready = false;
   for (let i = 0; i < 160; i++) {
-    const r = await request('GET', '/healthz');
-    if (r.status === 200) { health = JSON.parse(r.text); break; }
-    await new Promise((r2) => setTimeout(r2, 250));
+    assertAlive();
+    const r = await request('GET', '/status', undefined, token, 1500);
+    assertAlive();
+    if (r.status === 200) {
+      const s = JSON.parse(r.text);
+      if (s.token !== token || s.port !== PORT || s.logFile !== path.join(dataDir, 'bridge.log')) {
+        throw new Error('Authenticated status does not identify our worker');
+      }
+      if (s.signedIn !== false) throw new Error('Offline isolation failed: worker is signed in');
+      ready = true;
+      break;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 250));
   }
-  if (!health) {
-    console.log('FAIL：worker 没起来\n' + logs.join('').slice(-2000));
-    child.kill();
-    process.exit(1);
-  }
+  if (!ready) throw new Error('worker startup timed out (no authenticated status from our worker)');
+  const healthRes = await request('GET', '/healthz');
+  const health = JSON.parse(healthRes.text);
 
   console.log('\n--- /healthz 最小集（不泄露本地 Token）---');
   ok('healthz 只有 ok/port/modelCount', JSON.stringify(Object.keys(health).sort()) === '["modelCount","ok","port"]', JSON.stringify(Object.keys(health)));
@@ -80,8 +141,7 @@ function readState(dataDir) {
   ok('healthz 不带用户账号', health.user === undefined);
   ok('portIsOurs 需要的三个字段都在', health.ok === true && typeof health.port === 'number' && 'modelCount' in health);
 
-  const token = readState(dataDir).token;
-  ok('state.json 里有本地 token', typeof token === 'string' && token.length > 10, String(token).slice(0, 4) + '…');
+  ok('state.json 保留本次随机本地 token', readState(dataDir).token === token);
 
   console.log('\n--- /status 需要鉴权 ---');
   const anon = await request('GET', '/status');
@@ -94,6 +154,8 @@ function readState(dataDir) {
   ok('带 token 打 /status 回 200', statusRes.status === 200, statusRes.status);
   let status = {};
   try { status = JSON.parse(statusRes.text); } catch {}
+  if (status.signedIn !== false) throw new Error('Offline isolation failed: worker is signed in');
+  ok('离线测试未登录（禁止 live 模型请求）', status.signedIn === false);
   ok('/v1/status 也能取到完整状态', (await request('GET', '/v1/status', undefined, token)).status === 200);
 
   console.log('\n--- 状态对象新字段 ---');
@@ -104,11 +166,7 @@ function readState(dataDir) {
   ok('checkin 带下次开轮时间', Number.isFinite(Number(status.checkin.nextAt)), new Date(status.checkin.nextAt).toISOString());
   // 未登录时 refreshUsage 走的是 error 分支，只写 { at, error }，压根没有这两个键，
   // 所以只能在登录态下硬断言，否则离线跑测试必挂（issue #8）。
-  if (status.signedIn) {
-    ok('额度重置/会员到期字段存在（可为空）', 'resetAt' in (status.usage || {}) || 'expiresAt' in (status.usage || {}));
-  } else {
-    skip('额度重置/会员到期字段存在（可为空）', '未登录 Qoder，用量接口拿不到额度/会员字段');
-  }
+  skip('额度重置/会员到期字段存在（可为空）', '离线测试禁止登录/上游请求');
 
   console.log('\n--- 日志落盘 ---');
   const logPath = path.join(dataDir, 'bridge.log');
@@ -137,44 +195,9 @@ function readState(dataDir) {
   }
 
   const target = models.find((m) => (m.reasoning?.supported_efforts || []).length > 0) || models[0];
-  if (!status.signedIn || !target) {
-    // 没登录态的机器上真打不了上游，这几项跳过而不是崩掉（issue #7）。
-    console.log('\n--- 本地用量账本 / 错误码人话（需登录 Qoder，跳过）---');
-    skip('真打一次 chat 成功', '未登录 Qoder 或 /v1/models 空');
-    skip('usage.json 记账断言', '同上');
-    skip('未知模型与 401 断言', '同上');
-  } else {
-    console.log('\n--- 本地用量账本 ---');
-    const chat = await request('POST', '/v1/chat/completions', {
-      model: target.id,
-      messages: [{ role: 'user', content: '只回两个字：收到' }],
-      max_tokens: 16,
-    }, token);
-    ok('真打一次 chat 成功', chat.status === 200, chat.status);
-
-    await new Promise((r) => setTimeout(r, 400));
-    const after = JSON.parse((await request('GET', '/status', undefined, token)).text);
-    ok('usage.json 已生成', fs.existsSync(path.join(dataDir, 'usage.json')));
-    ok('今日请求数被记账', after.localUsage.today.requests >= 1, JSON.stringify(after.localUsage.today));
-    ok('今日模型明细里有这个模型', Boolean(after.localUsage.today.models?.[target.id]) || Boolean(after.localUsage.week.byModel?.[target.id]),
-      JSON.stringify(after.localUsage.week.byModel || {}).slice(0, 120));
-
-    console.log('\n--- 错误码人话 ---');
-    // 未知模型 id：Qoder 上游会自己兜底成默认模型，所以这里只要求不炸、不 500
-    const bad = await request('POST', '/v1/chat/completions', {
-      model: 'this-model-does-not-exist-xyz',
-      messages: [{ role: 'user', content: 'hi' }],
-      max_tokens: 8,
-    }, token);
-    ok('未知模型不会 500 崩掉', bad.status !== 500, bad.status);
-    let badBody = {};
-    try { badBody = JSON.parse(bad.text); } catch {}
-    if (badBody?.error?.message) {
-      ok('上报的错误是中文人话', /[\u4e00-\u9fa5]/.test(badBody.error.message), badBody.error.message.slice(0, 80));
-    } else {
-      ok('未知模型被上游兜底成正常回复', bad.status === 200, bad.status);
-    }
-  }
+  console.log('\n--- 离线模式：0 upstream，禁止 live 模型请求 ---');
+  skip('真实 chat / 上游兜底 / 请求记账', '此测试只允许离线验收，不存在 live 分支');
+  ok('离线账本没有模型请求', status.localUsage.today.requests === 0, status.localUsage.today.requests);
 
   console.log('\n--- 未登录也能验的输入校验 ---');
   // 鉴权失败这条路必须是中文人话
@@ -212,9 +235,23 @@ function readState(dataDir) {
   ok('映射表覆盖连不上', /连不上 Qoder/.test(src));
 
   console.log(`\n结果：${pass} 通过，${fail} 失败`);
-  child.kill();
-  setTimeout(() => process.exit(fail ? 1 : 0), 300);
+  assertAlive();
+  process.exitCode = fail ? 1 : 0;
+  } finally {
+    // Only terminate the ChildProcess we spawned; never inspect/kill a port owner.
+    if (child && !ended) {
+      child.kill();
+      let timer;
+      await Promise.race([stopped, new Promise((resolve) => { timer = setTimeout(resolve, 5000); })]);
+      clearTimeout(timer);
+      if (!ended) {
+        child.kill('SIGKILL');
+        await stopped;
+      }
+    }
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 })().catch((e) => {
   console.log('FAIL: ' + (e && e.stack ? e.stack : e));
-  process.exit(1);
+  process.exitCode = 1;
 });

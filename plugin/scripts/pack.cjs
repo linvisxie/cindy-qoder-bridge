@@ -24,6 +24,7 @@ const FILES = [
   { from: 'node/ownership.cjs', name: 'node/ownership.cjs' },
   { from: 'node/download.cjs', name: 'node/download.cjs' },
   { from: 'node/update-status.cjs', name: 'node/update-status.cjs' },
+  { from: 'node/native-update.cjs', name: 'node/native-update.cjs' },
   // MIT 要求分发时随附许可与版权声明，跑到别人机器上的 .cindy 才是真正的「分发」。
   { from: '../LICENSE', name: 'LICENSE' },
   { from: '../NOTICE', name: 'NOTICE' },
