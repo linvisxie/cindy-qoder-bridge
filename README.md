@@ -46,6 +46,10 @@ Cindy 的三个 harness 引擎（`pi` / `claude-code` / `codex`）都能接。
   <img src="assets/models.png" width="620" alt="Cindy 供应商页的模型列表：DeepSeek-Flash · 免费、DeepSeek-V4-Pro · x0.5、GLM-5.3-Flash · x0.1 等">
 </p>
 
+## 0.1.22 原生更新修复（2026-11-15）
+
+旧实现的 `spawn` 事件只表示请求进程启动，不等于安装成功：Qoder 现场留下四份解包，运行版本仍为 0.1.20；Trae 仍为 0.1.12。现有证据不能断言是宿主杀死 detached 进程。新版改走 Cindy 原生安装确认，直到新 worker 运行版本达到目标才显示安装完成，随后再次检查 GitHub latest 判断是否已最新。本轮不发起模型请求；此范围不适用于历史测试。本节不声明本轮已 live 验收、已发布或已安装，完成后的最终回执另行记录。另见独立的 [Trae 桥](https://github.com/linvisxie/trae-cindy-bridge) 0.1.14。
+
 ## 0.1.21 验收与发行状态（2026-11-11）
 
 已将未发布审查修复纳入本版，公开发行状态以 GitHub Releases 为准，发布不等于本机安装。真实 Qoder CN 退出 → 普通读取立即清缓存 → 用户重新登录 `valid`，以及真实 auth 短暂移除 / 无覆盖恢复均已验收；真实 `Local State` 逐字未改，最终登录正常。临时副本上的真实 auth + Windows DPAPI 保护的新 AES key 轮换、key cache 失效、临时损坏 fallback 和 VM 局部时间推进过期验证也已通过，副本已删除，全程无上游请求。**未修改或轮换 Windows 系统根密钥，未验证真实客户端自然生成新 key。** 详见 [凭据验收记录](docs/CREDENTIAL-ACCEPTANCE-2026-11-11.md)。独立真实 profile 复读已确认 `valid`、未过期且与 cache 一致，未修改真实 profile、无上游请求；见[永久布尔证据](docs/credential-acceptance-2026-11-11.json)。
@@ -78,13 +82,14 @@ Qoder 不是 OpenAI 兼容端点，所以需要三样东西：
 | `plugin/node/bootstrap.cjs` | 清单 `node.entry`（`node/bootstrap.cjs`）：先取得安装目录与数据目录双锁，再加载全部业务模块 / worker |
 | `plugin/node/worker.cjs` | Node 常驻进程：解密登录态、起 HTTP 服务、三条协议路由 |
 | `plugin/node/adapters.cjs` | Anthropic / Responses 与 OpenAI Chat 之间的协议翻译 |
-| `plugin/node/update.cjs` | 自更新纯函数：版本比较、digest 校验、zip 解包、脚本生成 |
+| `plugin/node/native-update.cjs` | 生产原生更新：校验包、定位实际同一 Cindy.exe，通过公开 `.cindy` 文件打开契约交给宿主确认安装 |
+| `plugin/node/update.cjs` | 共用版本 / digest / ZIP 校验辅助；旧脚本生成仅供旧回归与恢复，不再用于生产安装路径 |
 | `plugin/node/download.cjs` | 限制更新下载地址、重定向与包大小 |
 | `plugin/node/ownership.cjs` | 安装目录与运行数据目录的 OS 独占所有权 |
-| `plugin/node/update-status.cjs` | 更新 journal attempt / result 与中断恢复启动检查 |
+| `plugin/node/update-status.cjs` | 旧版本遗留 journal attempt / result 与中断恢复启动检查；新原生更新不写此 journal |
 | `plugin/panel.*` | 右侧栏面板：账号、额度、签到、模型列表、Base URL / API Key |
 
-它只管理自身插件文件与运行数据，**不直接修改 Cindy 的宿主安装收据或供应商配置**。供应商仍需在 Cindy 界面手动添加；自更新与宿主安装记录的区别见下文。
+它只管理自身插件文件与运行数据，**不直接修改 Cindy 的宿主安装收据或供应商配置**。供应商仍需在 Cindy 界面手动添加；原生更新由宿主一次完成文件安装、安装登记和插件重启，见下文。
 
 ## 环境依赖（请逐条核对）
 
@@ -160,7 +165,7 @@ Cindy → 插件页 → 导入 `.cindy`（也可以直接把文件拖进去）�
 1. Qoder 登录过期 → 在 Qoder CN 客户端重新登录，然后点面板上的「刷新」。
 2. `47821` 被别的软件占了 → worker 会顺延到 `47822`…，此时面板显示的 Base URL 变了，要去 Cindy 里改一下。
 3. 卸载重装插件 → 供应商要重新填一次。
-4. 自更新替换运行文件后 → 用 Cindy 原生导入完整 `.cindy` 包刷新宿主安装记录。
+4. 更新时 → 在自动打开的 Cindy 原生安装界面确认；无需手工寻找已下载文件或另行导入刷新记录。
 
 ## 面板能看什么
 
@@ -170,20 +175,20 @@ Cindy → 插件页 → 导入 `.cindy`（也可以直接把文件拖进去）�
 - **今日用量**：请求数 / tokens / 折算量（token × 倍率）
 - **模型列表**：每个模型的倍率（`· x0.2` / `· 免费`）与推理档位
 - **日志**：`bridge.log` 路径，出问题先看它
-- **检查更新**：「复制配置」右边那个按钮。点一下查 GitHub Releases，有新版会变成「安装 x.y.z」，再点一次才真装（装完进程会退出重启，所以要点两次）。装的时候先备份整个安装目录到 `<目录>.bak-<旧版本>`，再覆盖文件。
+- **检查更新**：「复制配置」右边的按钮查询 GitHub latest；有新版再点「安装 x.y.z」，校验下载包后自动打开 Cindy 原生安装确认。确认后由宿主安装并重启插件；只有新 worker 运行版本达到目标才显示「安装完成」，之后再次检查 GitHub latest 比较才显示「已最新」。取消后可重试，错误明确提示；请求启动不算完成，不承诺无需确认的静默安装。
 
-AI 侧也能问：`qoder_status`、`qoder_endpoint`、`qoder_refresh`、`qoder_checkin`、`qoder_update` 五个工具。`qoder_update` 传 `action=apply` 就会下载安装。
+AI 侧也能问：`qoder_status`、`qoder_endpoint`、`qoder_refresh`、`qoder_checkin`、`qoder_update` 五个工具。`qoder_update` 传 `action=apply` 会下载并打开宿主原生安装确认，不绕过安全确认。
 
 ## 更新安全与运行边界
 
-- 更新必须提供合法的 **64 位十六进制 SHA-256** 并匹配包内容，不再降级成仅比较 size。下载仅接受本仓库指定 repo / tag / asset 的 GitHub HTTPS 地址；重定向逐跳检查允许域名，最多 5 跳，包上限 32 MiB。
-- 安装器等待旧 PID 退出；未退出就停止，不覆盖文件。退出后同样按 `INSTALL_DIR`（`install`）→ `DATA_DIR`（`data`）固定顺序取得 OS 独占锁，并在安装全过程持有双锁。取得双锁后，安装器校验 `latest-attempt.json` 的 attempt 身份；迟到脚本发现指针换代或不存在即拒绝复制。每次更新持久化 journal attempt / result；复制失败尝试回滚，回滚不覆盖 journal，失败保留诊断和 backup。`update-status` 检测到中断的 copy / rollback 会禁止 boot；journal `begin` 与 `applyUpdate` 均禁止覆盖尚未恢复的 attempt 指针，`begin` 拒绝 previous `handed_off`。pending handoff 未确认结果时不能发起新更新，应先检查 `<安装目录>.updates/attempt-*/install.log`，不保证自动重试。
-- 持久更新目录统一为 `UPDATE_DIR = canonicalDirectory(INSTALL_DIR) + '.updates'`，即规范化安装目录同级的 `<安装目录>.updates`，不再使用数据目录的 `update/`。bootstrap、worker 与安装器都检查这里的 journal，与 `DATA_DIR` 无关，换数据目录不能绕过，rollback 也不覆盖它。
-- **中断恢复需手动处理 journal，原生导入不会自动解除阻断。** Cindy 原生导入完整 `.cindy` 包不会清除安装目录同级的 journal。中断 copy / rollback 失败后，保留所有日志与 backup；通过 Cindy 原生导入完整包并确认成功后，停用插件，将 `<安装目录>.updates/latest-attempt.json` **重命名保留诊断**，再启用插件。不要删除备份和日志。
-- **自更新成功仅表示插件运行文件替换成功，不代表 Cindy 的宿主安装记录已刷新。** 不再自动同步宿主安装快照，也不直接写 `ghost-install-state` 安装收据或通过 `process.execPath` 执行同步脚本。Cindy 0.1.128 尚无已验证的公开插件自写收据 API；请通过 **Cindy 插件页原生导入完整 `.cindy` 包**刷新安装记录。
+- 更新必须提供合法的 **64 位十六进制 SHA-256** 并匹配包内容，不再降级成仅比较 size。下载仅接受本仓库指定 repo / tag / asset 的 GitHub HTTPS 地址；重定向逐跳检查允许域名，最多 5 跳，包上限 32 MiB；同时严格校验 ZIP 内插件身份和目标版本。
+- **旧版本遗留安装器（仅旧回归 / 恢复，非生产路径）**：安装器等待旧 PID 退出；未退出就停止，不覆盖文件。退出后同样按 `INSTALL_DIR`（`install`）→ `DATA_DIR`（`data`）固定顺序取得 OS 独占锁，并在安装全过程持有双锁。取得双锁后，安装器校验 `latest-attempt.json` 的 attempt 身份；迟到脚本发现指针换代或不存在即拒绝复制。每次更新持久化 journal attempt / result；复制失败尝试回滚，回滚不覆盖 journal，失败保留诊断和 backup。`update-status` 检测到中断的 copy / rollback 会禁止 boot；journal `begin` 与 `applyUpdate` 均禁止覆盖尚未恢复的 attempt 指针，`begin` 拒绝 previous `handed_off`。pending handoff 未确认结果时不能发起新更新，应先检查 `<安装目录>.updates/attempt-*/install.log`，不保证自动重试。
+- **旧版本遗留 journal（新原生更新不写入）**：持久更新目录统一为 `UPDATE_DIR = canonicalDirectory(INSTALL_DIR) + '.updates'`，即规范化安装目录同级的 `<安装目录>.updates`，不再使用数据目录的 `update/`。bootstrap、worker 与安装器都检查这里的 journal，与 `DATA_DIR` 无关，换数据目录不能绕过，rollback 也不覆盖它。
+- **旧版本遗留中断恢复：需手动处理 journal，原生导入不会自动解除阻断。** Cindy 原生导入完整 `.cindy` 包不会清除安装目录同级的 journal。中断 copy / rollback 失败后，保留所有日志与 backup；通过 Cindy 原生导入完整包并确认成功后，停用插件，将 `<安装目录>.updates/latest-attempt.json` **重命名保留诊断**，再启用插件。不要删除备份和日志。
+- **生产更新统一交给 Cindy 原生安装**：Windows 使用实际运行的同一 `Cindy.exe` 的公开 `.cindy` 文件打开契约，自动递交已校验包并保留宿主安全确认。确认后宿主一次完成文件安装、安装登记与插件重启。插件不直接写 receipt / trust，不复制安装目录，不主动退出 worker，也不启动 PowerShell 后台 copy；打开请求成功不等于安装完成。
 - 清单 `node.entry` 为 `node/bootstrap.cjs`：先按 `INSTALL_DIR`（`install`）→ `DATA_DIR`（`data`）固定顺序取得 OS 独占锁，之后才加载全部业务模块 / worker。Windows 使用命名管道，Linux abstract socket 仅用于 offline CI，不代表支持 Linux 运行插件。**同一安装目录即使数据目录不同也拒绝同时运行；不同端口也不能共享数据目录。多实例的安装目录和数据目录必须都不同。**
 - Qoder #31 移除 `refreshCredential` 五分钟 time-only fastpath：普通读取立即观察 logout / delete / replace，明确退出或缺失立即清缓存，仅 `temporary` 失败允许旧票 fallback。DPAPI key 仍按 `Local State` 身份缓存，身份变化使 key cache 失效；key helper 合并单 profile 的 inflight，失败后冷却 1 秒，auth 仍逐次读取。凭据读取区分 `valid` / `absent` / `logged-out` / `temporary`，过期按当前时间判断；临时读取失败不等同登出。适配器流中错误使用 worker 的 `formatError` 中文分类，保留已获 usage，并按失败终止，不伪装成正常完成。
-- Cindy 0.1.128 通过 `require` 加载 Node entry，已验证与 bootstrap 兼容；公开发行状态以 GitHub Releases 为准，发布不等于本机安装。本轮 Windows 安装故障验证使用真实临时目录，**不是真实插件安装验证**；本版真实用户退出 / 重登凭据验收已完成，详见上方验收记录。测试通过不代表无 bug，也不扩大原有权限。
+- Cindy 0.1.128 通过 `require` 加载 Node entry，已验证与 bootstrap 兼容；公开发行状态以 GitHub Releases 为准，发布不等于本机安装。历史 Windows 安装故障验证使用真实临时目录，**不是真实插件安装验证**；0.1.21 真实用户退出 / 重登凭据验收已完成，详见上方验收记录。测试通过不代表无 bug，也不扩大原有权限。
 
 ## 运行数据在哪
 
@@ -193,7 +198,7 @@ AI 侧也能问：`qoder_status`、`qoder_endpoint`、`qoder_refresh`、`qoder_c
 | `%APPDATA%\CindyGlobal\qoder-bridge\state.json` | 本地端点 token + 端口 |
 | `%APPDATA%\CindyGlobal\qoder-bridge\models.json` | 模型目录缓存（30 分钟） |
 | `%APPDATA%\CindyGlobal\qoder-bridge\usage.json` | 本地用量账本（按天按模型，留 60 天） |
-| `<安装目录>.updates/`（`UPDATE_DIR`） | 安装目录同级的持久更新 journal、`latest-attempt.json`、`attempt-*/install.log`、下载包、暂存目录与替换脚本；与数据目录无关 |
+| `<安装目录>.updates/`（`UPDATE_DIR`） | 旧版本遗留（新原生更新不写此 journal）：安装目录同级的持久更新 journal、`latest-attempt.json`、`attempt-*/install.log`、下载包、暂存目录与替换脚本；与数据目录无关 |
 | `%APPDATA%\CindyGlobal\qoder-bridge\bridge.log` | 运行日志，超 2 MB 自动滚成 `.1` |
 
 **你的 Qoder token 不会被写进这些文件** —— 每次都是现从 Qoder 客户端目录里的 `auth.v1.dat` 解密，只在内存里用。

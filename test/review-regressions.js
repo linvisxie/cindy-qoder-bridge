@@ -21,6 +21,10 @@ function worker(options = {}) {
   const baseRequire = createRequire(file);
   const dir = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'bridge-review-'));
   temporary.push(dir);
+  const installDir = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'bridge-install-'));
+  temporary.push(installDir);
+  fs.mkdirSync(path.join(installDir, 'node'));
+  fs.writeFileSync(path.join(installDir, 'ghost.json'), JSON.stringify({ ...MANIFEST, version: options.runningVersion || MANIFEST.version }));
   const launches = [], exits = [], ownershipCalls = [];
   const owner = {
     held: true,
@@ -29,9 +33,15 @@ function worker(options = {}) {
   const installation = { ...owner };
   const ctx = vm.createContext({
     __CINDY_BRIDGE_OWNERSHIP: options.unowned ? undefined : { installation, data: owner },
-    __dirname: path.dirname(file), Buffer, URL, TextDecoder, AbortController, AbortSignal,
+    __dirname: path.join(installDir, 'node'), Buffer, URL, TextDecoder, AbortController, AbortSignal,
     fetch: async () => { throw new Error('unexpected fixture fetch'); },
     require(id) {
+      if (id === './native-update.cjs') return { ...baseRequire(id), async launchImport(request) {
+        launches.push(request);
+        if (options.launchImport) return options.launchImport(request);
+        if (options.openError) throw options.openError;
+        return { installRequested: true };
+      } };
       if (id === './update-status.cjs') return { ...baseRequire(id), updateDirectory: () => path.join(dir, 'update') };
       if (id === './ownership.cjs') return { pipeName: (_directory, scope = 'data') => '\\\\.\\pipe\\fixture-' + scope, async acquireOwnership(directory) {
         ownershipCalls.push(directory);
@@ -42,12 +52,7 @@ function worker(options = {}) {
       if (id === './trae.cjs' && options.trae) return options.trae;
       if (id === 'node:child_process') return {
         ...baseRequire(id),
-        spawn() {
-          const child = new EventEmitter(); child.unref = () => {};
-          launches.push(child);
-          queueMicrotask(() => child.emit(options.spawnError ? 'error' : 'spawn', options.spawnError));
-          return child;
-        },
+        spawn() { throw new Error('must not spawn an external installer'); },
       };
       return baseRequire(id);
     },
@@ -62,7 +67,7 @@ function worker(options = {}) {
   // Retain the real implementation, omit resident boot and stdio event registration.
   vm.runInContext(fs.readFileSync(file, 'utf8').split('// JSON-RPC over stdio')[0], ctx, { filename: file });
   vm.runInContext("loadCredential=async()=>({status:'absent'})", ctx);
-  return { ctx, dir, launches, exits, owner, installation, ownershipCalls, run: (source) => vm.runInContext(source, ctx) };
+  return { ctx, dir, installDir, launches, exits, owner, installation, ownershipCalls, run: (source) => vm.runInContext(source, ctx) };
 }
 
 test('worker requires both bootstrap owners and never acquires ownership itself', async () => {
@@ -73,6 +78,7 @@ test('worker requires both bootstrap owners and never acquires ownership itself'
   for (const owner of [w.installation, w.owner]) {
     owner.held = false;
     await assert.rejects(w.run('ensureOwnership()'), /ownership|required|lost/i);
+    await assert.rejects(w.run('applyUpdate()'), /ownership|required|lost/i);
     assert.throws(() => w.run('saveState({fixture:false})'), /ownership|required|lost/i);
     owner.held = true;
     const heldAssertion = owner.assertHeld;
@@ -143,10 +149,10 @@ for (const input of [123, 0]) for (const route of ['/v1/messages', '/v1/response
 
 const validManifest = { ...MANIFEST, version: '99.0.0' };
 function entries(manifest = validManifest) {
-  return ['ghost.json', 'main.js', 'panel.js', 'panel.html', 'node/worker.cjs', 'node/bootstrap.cjs', 'node/adapters.cjs', 'node/update.cjs', 'node/ownership.cjs', 'node/download.cjs', 'node/update-status.cjs', ...(IS_TRAE ? ['node/trae.cjs'] : [])]
+  return ['ghost.json', 'main.js', 'panel.js', 'panel.html', 'node/worker.cjs', 'node/bootstrap.cjs', 'node/adapters.cjs', 'node/update.cjs', 'node/ownership.cjs', 'node/download.cjs', 'node/update-status.cjs', 'node/native-update.cjs', ...(IS_TRAE ? ['node/trae.cjs'] : [])]
     .map(name => ({ name, data: Buffer.from(name === 'ghost.json' ? JSON.stringify(manifest) : 'fixture') }));
 }
-const expected = { id: MANIFEST.id, version: '99.0.0', currentVersion: MANIFEST.version, required: ['node/bootstrap.cjs', 'node/adapters.cjs', 'node/update.cjs', 'node/ownership.cjs', 'node/download.cjs', 'node/update-status.cjs', ...(IS_TRAE ? ['node/trae.cjs'] : [])] };
+const expected = { id: MANIFEST.id, version: '99.0.0', currentVersion: MANIFEST.version, required: ['node/bootstrap.cjs', 'node/adapters.cjs', 'node/update.cjs', 'node/ownership.cjs', 'node/download.cjs', 'node/update-status.cjs', 'node/native-update.cjs', ...(IS_TRAE ? ['node/trae.cjs'] : [])] };
 // Small ZIP writer for controlled updater fixtures (stored entries, valid CRC).
 function zip(list) {
   const local = [], central = []; let offset = 0;
@@ -176,9 +182,10 @@ function prepareUpdate(w, list) {
   w.run(`checkUpdate=async()=>({current:'${MANIFEST.version}',latest:'99.0.0',hasUpdate:true,asset})`);
 }
 
-for (const field of ['digest', 'size']) test(`update rejects incorrect ${field} before installer launch`, async () => {
+for (const field of ['digest', 'size', 'missing digest']) test(`update rejects incorrect ${field} before installer launch`, async () => {
   const w = worker(); prepareUpdate(w, entries());
-  w.ctx.asset[field] = field === 'digest' ? 'sha256:' + '0'.repeat(64) : w.ctx.asset.size + 1;
+  if (field === 'missing digest') delete w.ctx.asset.digest;
+  else w.ctx.asset[field] = field === 'digest' ? 'sha256:' + '0'.repeat(64) : w.ctx.asset.size + 1;
   await assert.rejects(w.run('applyUpdate()'));
   assert.equal(w.launches.length, 0); assert.equal(w.exits.length, 0);
 });
@@ -250,6 +257,7 @@ for (const [label, alter] of [
   ['missing worker', () => entries().filter(e => e.name !== 'node/worker.cjs')],
   ['missing bootstrap', () => entries().filter(e => e.name !== 'node/bootstrap.cjs')],
   ['missing owner', () => entries().filter(e => e.name !== 'node/ownership.cjs')],
+  ['missing native updater', () => entries().filter(e => e.name !== 'node/native-update.cjs')],
   ['invalid declared entry', () => entries({ ...validManifest, entry: '../outside.js' })],
 ]) {
   test(`updater refuses ${label} before launching installer`, async () => {
@@ -258,37 +266,101 @@ for (const [label, alter] of [
     assert.equal(w.launches.length, 0); assert.equal(w.exits.length, 0);
   });
 }
-for (const code of ['ENOENT', 'EACCES']) test(`installer ${code} leaves worker running and cleans staging`, async () => {
-  const w = worker({ spawnError: Object.assign(new Error(code), { code }) }); prepareUpdate(w, entries());
+for (const code of ['ENOENT', 'EACCES']) test(`native open ${code} leaves worker serving and records failure`, async () => {
+  const w = worker({ openError: Object.assign(new Error(code), { code }) }); prepareUpdate(w, entries());
   await assert.rejects(w.run('applyUpdate()'), new RegExp(code));
   assert.equal(w.launches.length, 1); assert.equal(w.exits.length, 0);
   assert.equal(w.run('updateInFlight'), false);
-  const updateDir = path.join(w.dir, 'update');
-  const journal = require('../plugin/node/update-status.cjs').readLatest(updateDir);
-  assert.equal(journal.status, 'not_started'); assert.equal(journal.phase, 'failed');
-  assert.match(journal.error, new RegExp(code));
-  assert.equal(journal.hostReceipt, 'requires_host_install');
-  assert.ok(!fs.readdirSync(updateDir).some(name => name.startsWith('stage-')));
+  const record = require('../plugin/node/native-update.cjs').readStatus(w.dir, MANIFEST.version);
+  assert.equal(record.state, 'open_failed'); assert.match(record.error, new RegExp(code));
+  assert.ok(fs.existsSync(record.packagePath));
+  assert.equal(w.owner.held, true); assert.equal(w.installation.held, true);
+  w.run('saveState({stillServing:true});actualPort=1;lastUsage={};lastCheckin={}');
+  assert.equal((await w.run('buildStatus()')).ok, true);
+  assert.deepEqual(fs.readdirSync(path.join(w.dir, 'update')), [path.basename(record.packagePath)]);
 });
-test('successful spawn keeps update locked until worker exits', async () => {
+test('native import retains worker and owners; cancellation permits a fresh explicit request', async () => {
   const w = worker(); prepareUpdate(w, entries());
+  w.run('actualPort=1;lastUsage={};lastCheckin={}');
   const first = await w.run('applyUpdate()');
-  const pointerPath = path.join(w.dir, 'update', 'latest-attempt.json');
-  const pointer = fs.readFileSync(pointerPath);
+  assert.equal(first.applied, false); assert.equal(first.installRequested, true);
+  assert.equal(first.status, 'awaiting_confirmation');
+  assert.equal(w.launches[0].packagePath, first.packagePath);
+  assert.equal(w.launches[0].hostExe, process.execPath);
+  assert.equal(w.launches[0].sha256, crypto.createHash('sha256').update(fs.readFileSync(first.packagePath)).digest('hex'));
+  assert.equal((await w.run('buildStatus()')).updateResult.state, 'awaiting_confirmation');
+  assert.equal(w.owner.held, true); assert.equal(w.installation.held, true);
+  assert.equal(w.exits.length, 0); assert.equal(w.run('updateInFlight'), false);
   const second = await w.run('applyUpdate()');
-  assert.equal(first.applied, true); assert.equal(second.applied, false);
-  assert.deepEqual(fs.readFileSync(pointerPath), pointer);
-  const script = fs.readFileSync(first.scriptPath, 'utf8');
-  assert.ok(script.includes("$installationPipe = '\\\\.\\pipe\\fixture-install'"));
-  assert.ok(script.includes("$ownershipPipe = '\\\\.\\pipe\\fixture-data'"));
-  assert.ok(script.includes('$latestPointer = ' + updater.psQuote(path.join(w.dir, 'update', 'latest-attempt.json'))));
-  const result = JSON.parse(fs.readFileSync(first.resultPath));
-  assert.equal(result.status, 'handed_off'); assert.equal(result.phase, 'waiting');
-  assert.equal(result.hostReceipt, 'requires_host_install');
-  assert.match(first.backup, /\.bak-.*-attempt-[a-f0-9-]+$/);
-  assert.equal(w.exits.length, 1); assert.equal(w.launches.length, 1);
-  assert.equal(w.run('updateInFlight'), true);
+  assert.equal(second.installRequested, true); assert.notEqual(first.packagePath, second.packagePath);
+  assert.equal(w.launches.length, 2);
+  assert.ok(fs.readdirSync(path.join(w.dir, 'update')).every(name => /^[a-f0-9-]+\.cindy$/.test(name)));
+  assert.deepEqual(fs.readdirSync(w.installDir).sort(), ['ghost.json', 'node']);
 });
+test('only download/open request is exclusive and a finished request releases it', async () => {
+  let finish, opened;
+  const opening = new Promise(resolve => { opened = resolve; });
+  const w = worker({ launchImport: () => new Promise(resolve => { finish = resolve; opened(); }) });
+  prepareUpdate(w, entries());
+  const pending = w.run('applyUpdate()');
+  await Promise.race([opening, pending.then(() => { throw Error('request ended without opening confirmation'); })]);
+  assert.equal(w.run('updateInFlight'), true);
+  assert.equal((await w.run('applyUpdate()')).applied, false);
+  assert.equal(w.launches.length, 1);
+  finish(); await pending;
+  assert.equal(w.run('updateInFlight'), false);
+  assert.equal(w.owner.held, true); assert.equal(w.installation.held, true);
+});
+
+test('running version is captured, native completion is not a remote latest claim, repeat is up to date', async () => {
+  const native = require('../plugin/node/native-update.cjs');
+  const w = worker({ runningVersion: '99.0.0' });
+  // A replaced manifest must not change the version of the already loaded worker.
+  fs.writeFileSync(path.join(w.installDir, 'ghost.json'), JSON.stringify({ ...MANIFEST, version: '100.0.0' }));
+  native.writeStatus(w.dir, { state: 'awaiting_confirmation', targetVersion: '99.0.0', fromVersion: MANIFEST.version,
+    packagePath: path.join(w.dir, 'previous.cindy'), sha256: 'a'.repeat(64) });
+  w.run('actualPort=1;lastUsage={};lastCheckin={}');
+  const status = await w.run('buildStatus()');
+  assert.equal(status.version, '99.0.0'); assert.equal(status.updateResult.state, 'completed');
+  assert.match(status.updateResult.message, /安装完成/); assert.doesNotMatch(status.updateResult.message, /最新/);
+  w.ctx.fetch = async () => ({ ok: true, json: async () => ({ tag_name: 'v99.0.0', assets: [] }) });
+  const checked = await w.run('checkUpdate()');
+  assert.equal(checked.applied, false); assert.equal(checked.status, 'up_to_date');
+  for (let i = 0; i < 2; i++) {
+    const result = await w.run('applyUpdate()');
+    assert.equal(result.current, '99.0.0'); assert.equal(result.applied, false);
+    assert.equal(result.status, 'up_to_date'); assert.match(result.message, /最新/);
+  }
+  assert.equal(w.launches.length, 0); assert.equal(w.exits.length, 0);
+  assert.equal(fs.existsSync(path.join(w.dir, 'update')), false);
+  const older = worker();
+  fs.writeFileSync(path.join(older.installDir, 'ghost.json'), JSON.stringify({ ...MANIFEST, version: '99.0.0' }));
+  older.ctx.fetch = w.ctx.fetch;
+  const check = await older.run('checkUpdate()');
+  assert.equal(check.current, MANIFEST.version); assert.equal(check.hasUpdate, true);
+  native.writeStatus(older.dir, { state: 'awaiting_confirmation', targetVersion: '99.0.0', fromVersion: MANIFEST.version,
+    packagePath: path.join(older.dir, 'pending.cindy'), sha256: 'b'.repeat(64) });
+  older.run('lastUsage={};lastCheckin={}');
+  assert.equal((await older.run('buildStatus()')).updateResult.state, 'awaiting_confirmation');
+  w.ctx.fetch = async () => ({ ok: true, json: async () => ({ assets: [] }) });
+  await assert.rejects(w.run('applyUpdate()'), /版本无效/);
+  assert.equal(w.launches.length, 0);
+});
+
+test('download failure preserves legacy recovery evidence and releases request lock', async () => {
+  const journal = require('../plugin/node/update-status.cjs');
+  const w = worker(); prepareUpdate(w, entries());
+  const dir = path.join(w.dir, 'update'), attempt = journal.begin(dir, 'attempt-abc');
+  journal.writeResult(attempt, { status: 'not_started', phase: 'failed' });
+  const pointer = fs.readFileSync(path.join(dir, 'latest-attempt.json'));
+  const result = fs.readFileSync(path.join(attempt, 'result.json'));
+  w.ctx.fetch = async () => { throw new Error('fixture offline'); };
+  await assert.rejects(w.run('applyUpdate()'), /offline/);
+  assert.deepEqual(fs.readFileSync(path.join(dir, 'latest-attempt.json')), pointer);
+  assert.deepEqual(fs.readFileSync(path.join(attempt, 'result.json')), result);
+  assert.equal(w.run('updateInFlight'), false); assert.equal(w.launches.length, 0);
+});
+
 test('release selection uses exact plugin package name', async () => {
   const w = worker();
   w.ctx.fetch = async () => ({ ok: true, json: async () => ({ tag_name: 'v99.0.0', assets: [

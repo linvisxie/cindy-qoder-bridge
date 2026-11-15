@@ -52,16 +52,22 @@
   async function ask(type, timeoutMs = 12000) {
     if (!channel) return { error: '面板不支持 BroadcastChannel' };
     const reqId = type + '-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8);
+    let timer, resend;
     const p = new Promise((resolve) => pending.set(reqId, resolve));
-    try { await fetch(WAKE_URL); } catch {}
     const payload = { __panel: true, reqId, type };
-    const resend = setInterval(() => { try { channel.postMessage(payload); } catch {} }, 400);
-    try { channel.postMessage(payload); } catch {}
-    const timeout = new Promise((r) => setTimeout(() => r(null), timeoutMs));
-    const value = await Promise.race([p, timeout]);
-    clearInterval(resend);
-    pending.delete(reqId);
-    return value;
+    const send = () => { try { channel.postMessage(payload); } catch {} };
+    try {
+      const timeout = new Promise((r) => { timer = setTimeout(() => r(null), timeoutMs); });
+      // 唤醒失败或挂起也不能阻塞 RPC 的超时与按钮恢复。
+      Promise.resolve().then(() => fetch(WAKE_URL)).catch(() => {});
+      resend = setInterval(send, 400);
+      send();
+      return await Promise.race([p, timeout]);
+    } finally {
+      clearTimeout(timer);
+      clearInterval(resend);
+      pending.delete(reqId);
+    }
   }
 
   function render(st) {
@@ -87,10 +93,7 @@
       $('quota').textContent = ((q && q.note) ? q.note : '—') + stale;
     }
 
-    if (st.updateResult?.message && !$('checkUpdate').disabled) {
-      $('updateMsg').hidden = false;
-      $('updateMsg').textContent = st.updateResult.message;
-    }
+    renderUpdate(st);
     if (st.lastError) { $('err').hidden = false; $('err').textContent = st.lastError; }
     else $('err').hidden = true;
 
@@ -179,40 +182,100 @@
     setTimeout(() => { btn.textContent = '立即签到'; load(); }, 2500);
   });
 
-  // 更新按钮只有一个处理器、按 updateMode 分支：以前在处理器里再赋 btn.onclick，
-  // 两个处理器不会互相注销，「安装」态点一次会把检查和安装同时发出去并发跑。
-  let updateMode = 'check';
-  $('checkUpdate').addEventListener('click', async () => {
-    const btn = $('checkUpdate');
-    const msg = $('updateMsg');
-    if (updateMode === 'install') {
-      btn.disabled = true; btn.textContent = '安装中…';
-      const a = await ask('applyUpdate', 120000);
-      btn.disabled = false;
-      msg.textContent = a && a.applied ? a.message : ('安装失败：' + ((a && (a.error || a.message)) || '没有响应'));
-      btn.textContent = '检查更新';
+  // 单一处理器：原生确认等待不是失败，也不是安装完成。
+  let updateMode = 'check', targetVersion = '', runningVersion = '';
+  let updateBusy = false, updateSnapshot = '', checkedLatest = false;
+  function updateMessage(text) {
+    $('updateMsg').hidden = false;
+    $('updateMsg').textContent = text;
+  }
+  function updateButton() {
+    $('checkUpdate').textContent = updateMode === 'retry' ? '重新打开安装确认'
+      : updateMode === 'install' ? '安装 ' + targetVersion : '检查更新';
+  }
+  function versionAtLeast(current, target) {
+    if (!current || !target) return false;
+    if (current === target) return true;
+    const parse = (v) => /^v?\d+(\.\d+)*$/.test(v) ? v.replace(/^v/, '').split('.').map(Number) : null;
+    const a = parse(current), b = parse(target);
+    if (!a || !b) return false;
+    for (let i = 0; i < Math.max(a.length, b.length); i++) {
+      if ((a[i] || 0) !== (b[i] || 0)) return (a[i] || 0) > (b[i] || 0);
+    }
+    return true;
+  }
+  function renderUpdate(st) {
+    const native = st.updateResult || {};
+    const snapshot = JSON.stringify([st.version, native.state, native.status, native.targetVersion,
+      native.message, native.error, native.resultPath]);
+    if (updateBusy || snapshot === updateSnapshot) return;
+    updateSnapshot = snapshot;
+    runningVersion = st.version || runningVersion;
+    // 「已最新」只能由检查确认，保留到下次主动操作；轮询（包括迟到的旧版本）不能覆盖。
+    if (checkedLatest) return;
+    const target = targetVersion || (native.state ? native.targetVersion : '');
+    // 完成必须达到本轮目标；旧 attempt 的 completed 不能清掉更高的待安装目标。
+    if (target && versionAtLeast(st.version, target)) {
+      targetVersion = '';
       updateMode = 'check';
-      return;
+      updateMessage('安装完成，当前运行版本 ' + st.version);
+    } else if (native.state && native.state !== 'completed'
+      && (!targetVersion || !native.targetVersion || native.targetVersion === targetVersion)) {
+      targetVersion = target || '';
+      updateMode = 'retry';
+      const fallback = native.state === 'preparing' ? '正在准备原生安装确认。'
+        : native.state === 'open_failed' ? '打开原生安装确认失败，可重试。'
+        : native.state === 'awaiting_confirmation' ? '正在等待 Cindy 原生安装确认；若已取消，可重新打开安装确认。'
+        : '尚未确认安装完成，可重新打开安装确认。';
+      updateMessage((targetVersion ? '目标版本 ' + targetVersion + '：' : '') + (native.message || fallback));
+    } else if (!native.state && native.status && !targetVersion) {
+      // 旧安装日志仅作诊断，不是原生完成凭据，也不能覆盖本轮待安装目标。
+      updateMessage('旧版更新记录（' + native.status + '）：'
+        + (native.message || native.error || native.resultPath || '暂无诊断信息'));
     }
-    btn.disabled = true; btn.textContent = '检查中…';
-    const r = await ask('checkUpdate', 30000);
-    btn.disabled = false;
-    if (!r || r.error) {
-      btn.textContent = '检查更新';
-      msg.hidden = false;
-      msg.textContent = '检查失败：' + ((r && r.error) || '没有响应');
-      return;
+    updateButton();
+  }
+  $('checkUpdate').addEventListener('click', async () => {
+    if (updateBusy) return;
+    const btn = $('checkUpdate');
+    const apply = updateMode !== 'check';
+    updateBusy = true;
+    checkedLatest = false;
+    btn.disabled = true;
+    btn.textContent = apply ? '正在打开原生安装确认…' : '检查中…';
+    updateMessage(apply ? '正在准备 Cindy 原生安装确认…' : '正在检查更新…');
+    try {
+      const r = await ask(apply ? 'applyUpdate' : 'checkUpdate', apply ? 120000 : 30000);
+      if (!r || r.error) throw new Error((r && r.error) || '请求超时，没有响应');
+      if (apply) {
+        // apply 可能重新检查到了比之前 check 更新的版本，兼容旧 worker 的 latest 字段。
+        targetVersion = r.latest || r.targetVersion || targetVersion;
+        if (r.status === 'up_to_date') {
+          targetVersion = ''; updateMode = 'check'; checkedLatest = true;
+          updateMessage('已是最新版本（' + (r.current || runningVersion || '当前') + '）');
+        } else if (r.status === 'awaiting_confirmation' || r.installRequested) {
+          updateMode = 'retry';
+          updateMessage((targetVersion ? '目标版本 ' + targetVersion + '：' : '')
+            + (r.message || '正在等待 Cindy 原生安装确认；若已取消，可重新打开安装确认。'));
+        } else {
+          updateMode = 'retry';
+          updateMessage(r.message || '尚未确认安装完成，可重新打开安装确认。');
+        }
+      } else if (!r.hasUpdate) {
+        targetVersion = ''; updateMode = 'check'; checkedLatest = true;
+        updateMessage('已是最新版本（' + (r.current || '当前') + '）');
+      } else {
+        targetVersion = r.latest || r.targetVersion; updateMode = 'install';
+        updateMessage('发现新版本 ' + targetVersion + '（当前 ' + r.current + '），点「安装 ' + targetVersion + '」将打开 Cindy 原生安装确认，请在 Cindy 中确认安装。');
+      }
+    } catch (e) {
+      updateMode = apply ? 'retry' : 'check';
+      updateMessage((apply ? '打开安装确认失败：' : '检查失败：') + (e.message || String(e)) + '，可重试。');
+    } finally {
+      updateBusy = false;
+      btn.disabled = false;
+      updateButton();
     }
-    msg.hidden = false;
-    if (!r.hasUpdate) {
-      btn.textContent = '检查更新';
-      msg.textContent = '已是最新版本（' + (r.current || '当前') + '）';
-      return;
-    }
-    msg.textContent = '发现新版本 ' + r.latest + '（当前 ' + r.current + '），点「安装」会下载并替换，插件随后自动重启。';
-    btn.textContent = '安装 ' + r.latest;
-    // 装完进程会退出重启，所以第二次点击才真装，避免误触。
-    updateMode = 'install';
   });
 
   load();

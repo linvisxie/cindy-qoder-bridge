@@ -169,11 +169,15 @@ cindy.onHostMessage(async function (msg) {
       const r = await callWorker(apply ? 'qoder/applyUpdate' : 'qoder/checkUpdate', msg.callId);
       if (apply) {
         lastStatus = null;
-        ok({ text: r.applied ? r.message : `已经是最新的（${r.current || '当前版本'}），没有可安装的新版。` });
+        ok({ text: r.message || (r.status === 'up_to_date'
+          ? `已是最新版本（${r.current || '当前版本'}）。`
+          : r.status === 'awaiting_confirmation' || r.installRequested
+            ? '正在等待 Cindy 原生安装确认，请在 Cindy 中确认安装；若已取消，可再次 apply 重新打开安装确认。'
+            : '尚未确认安装完成，请查看面板状态或重试。') });
         return;
       }
       const lines = [`当前版本：${r.current || '(未知)'}`, `最新版本：${r.latest || '(未知)'}`];
-      lines.push(r.hasUpdate ? '有新版本，可以让 Qoder 桥自己装（action=apply）。' : '已经是最新的。');
+      lines.push(r.hasUpdate ? '有新版本，action=apply 将打开 Cindy 原生安装确认，请在 Cindy 中确认安装。' : '已是最新版本。');
       if (r.hasUpdate && r.asset) lines.push(`新包：${r.asset.name}（${Math.round((r.asset.size || 0) / 1024)} KB）`);
       if (r.htmlUrl) lines.push(`发布页：${r.htmlUrl}`);
       ok({ text: lines.join('\n') });

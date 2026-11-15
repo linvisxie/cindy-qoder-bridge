@@ -41,6 +41,8 @@ const SHARED_EXACT = [
   'plugin/node/bootstrap.cjs',
   'plugin/node/download.cjs',
   'plugin/node/update-status.cjs',
+  'plugin/node/native-update.cjs',
+  'test/native-update.js',
 ];
 
 // 只要求「去掉注释与空行后」相同的文件。

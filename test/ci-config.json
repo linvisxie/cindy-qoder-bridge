@@ -9,6 +9,7 @@
     { "script": "update-download", "timeout": 120 },
     { "script": "update-install-results", "timeout": 240 },
     { "script": "update-status", "timeout": 120 },
+    { "script": "native-update", "timeout": 120 },
     {
       "script": "host-guard",
       "timeout": 180
